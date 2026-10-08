@@ -86,7 +86,7 @@ CALENDAR_PROXY=1
 
 # Sonda de estado para QuemaOS: su propio puerto, del rango 9700-9799 de la suite. Escucha sólo en
 # 127.0.0.1; pon CALENDAR_QUEMAOS_HOST=0.0.0.0 si QuemaOS la consulta desde otra máquina.
-CALENDAR_QUEMAOS_PORT=9702
+CALENDAR_QUEMAOS_PORT=9705
 ENV
     chmod 640 "$ENV_DIR/calendar.env"
     chown root:"$SERVICE_USER" "$ENV_DIR/calendar.env"
@@ -119,7 +119,7 @@ done
 
 systemctl restart calendar-quemaos.service
 QPORT="$(grep -E '^CALENDAR_QUEMAOS_PORT=' "$ENV_DIR/calendar.env" | cut -d= -f2)"
-QPORT="${QPORT:-9702}"
+QPORT="${QPORT:-9705}"
 sleep 2
 
 echo

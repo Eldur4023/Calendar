@@ -25,16 +25,15 @@ Cambios respecto al plan inicial: el día 31 en una serie mensual **se salta** l
 3. **Servicio de escritorio**: réplica local, cola sin conexión, conflictos, avisos con `notify-send`, API local con secreto en fichero. 12 pruebas contra un servidor real.
 4. **Ventana**: mes, semana, día, agenda, editor con series («solo este / toda la serie»), calendarios, búsqueda, registro, atajos, bandeja, actualizaciones desde GitHub. 14 pruebas de la lógica en node; revisada a mano con capturas de la interfaz real.
 
-## Sonda de QuemaOS (2026-10-08)
+## Sonda de QuemaOS y despliegue (2026-10-08)
 
-Contrato y reglas en `~/Escritorio/Suite-Canon.md`. Calendar: proceso aparte `server/quemaos` en el 9702. Drive: `app/quemaos.py` (hilo con su propio `ThreadingHTTPServer`) en el 9701. Homeflix **no** la tiene en un puerto propio (ver el canon).
+Contrato, reglas y puertos en `~/Escritorio/Suite-Canon.md` (§5 y §6). Calendar: proceso aparte `server/quemaos` en el **9705**. Drive: app Lux aparte en el 9704. Homeflix: relé Lux en el 9700. **Desplegado en el servidor** (`burnt-server`, por Tailscale): Calendar (instalación nueva, sólo en 127.0.0.1:8100), Drive (actualizado) y las tres sondas; el código de descubrimiento de QuemaOS las ve las cinco.
 
 ## Sin hacer / pendiente de probar
 
 - **El instalador de escritorio y el del servidor no se han ejecutado de verdad** (piden `sudo`/`pkexec`): se comprobó la sintaxis, que el servicio arranca con el mismo endurecimiento de systemd (`systemd-run --user`), que `notify-send` funciona dentro de él y que el servidor arranca con el lanzador en la disposición instalada. Falta una primera instalación real.
 - **No se ha probado `deploy.sh` contra un servidor** (ni `setup-tls.sh`, copiado de Drive).
 - La ventana se probó en Firefox (mismo HTML/JS) y arrancada en una sesión con la pantalla bloqueada: no he visto el aspecto dentro de WebKitGTK ni la bandeja.
-- `calendar-quemaos.service` y su integración en `install.sh`/`remote-update.sh` (arranque, vuelta atrás) tampoco se han ejecutado de verdad; la sonda sí está probada contra un servidor real.
 - Los iconos de la aplicación (`desktop/app/icon.png`, `favicon.svg`) son nuevos y sólo los he visto a 256 px.
 
 ## Futuro

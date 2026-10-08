@@ -98,7 +98,7 @@ install -m 755 "$SOURCE_DIR/deploy/quemaos-run.sh" "$APP_DIR/quemaos-run.sh"
 cp "$SOURCE_DIR/deploy/calendar.service" /etc/systemd/system/calendar.service
 cp "$SOURCE_DIR/deploy/calendar-quemaos.service" /etc/systemd/system/calendar-quemaos.service
 # Instalaciones anteriores a la sonda: se añade su puerto a calendar.env sin tocar lo demás.
-grep -q '^CALENDAR_QUEMAOS_PORT=' "$ENV_FILE" || printf '\n# Sonda de QuemaOS (rango 9700-9799 de la suite). 0.0.0.0 en CALENDAR_QUEMAOS_HOST la abre a la red.\nCALENDAR_QUEMAOS_PORT=9702\n' >> "$ENV_FILE"
+grep -q '^CALENDAR_QUEMAOS_PORT=' "$ENV_FILE" || printf '\n# Sonda de QuemaOS (rango 9700-9799 de la suite). 0.0.0.0 en CALENDAR_QUEMAOS_HOST la abre a la red.\nCALENDAR_QUEMAOS_PORT=9705\n' >> "$ENV_FILE"
 install -m 755 "$SOURCE_DIR/deploy/calendar-cli.sh" /usr/local/bin/calendar-cli
 chown -R root:"$SERVICE_USER" "$APP_DIR"
 chmod -R g+rX "$APP_DIR"

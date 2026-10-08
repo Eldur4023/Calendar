@@ -15,7 +15,7 @@
 # reloj de abajo (cada 30 s), y si el reloj se para la propia sonda lo delata.
 #
 # Variables: CALENDAR_DB (la misma base del servidor; sólo se hacen SELECT), CALENDAR_URL (dónde
-# escucha el servidor, para comprobar que responde), CALENDAR_QUEMAOS_PORT (9702) y
+# escucha el servidor, para comprobar que responde), CALENDAR_QUEMAOS_PORT (9705) y
 # CALENDAR_QUEMAOS_HOST (127.0.0.1; 0.0.0.0 si QuemaOS la consulta desde otra máquina).
 
 import sqlite
@@ -26,7 +26,7 @@ import json
 
 app:
     name   "Calendar (sonda QuemaOS)"
-    port   env("CALENDAR_QUEMAOS_PORT", "9702")
+    port   env("CALENDAR_QUEMAOS_PORT", "9705")
     host   env("CALENDAR_QUEMAOS_HOST", "127.0.0.1")
     max_body "1KB"
 
@@ -111,7 +111,7 @@ fn bool measure():
 # El rango 9700-9799 lo impone el lanzador (deploy/quemaos-run.sh): una app Lux no puede
 # salir desde `on start:`. Si aun así arranca fuera de rango, la sonda lo dice en su estado.
 fn bool port_ok():
-    int port = int(os.getenv("CALENDAR_QUEMAOS_PORT", "9702"))
+    int port = int(os.getenv("CALENDAR_QUEMAOS_PORT", "9705"))
     return port >= 9700 and port <= 9799
 
 on start:

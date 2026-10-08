@@ -3,7 +3,7 @@
 # Lanzador de la sonda de QuemaOS (calendar-quemaos.service). Lee /etc/calendar/calendar.env:
 #
 #   CALENDAR_DB             la base del servidor (sólo se lee)
-#   CALENDAR_QUEMAOS_PORT   puerto de la sonda: 9700-9799, el rango de la suite (9702)
+#   CALENDAR_QUEMAOS_PORT   puerto de la sonda: 9700-9799, el rango de la suite (9705)
 #   CALENDAR_QUEMAOS_HOST   127.0.0.1; 0.0.0.0 si QuemaOS la consulta desde otra máquina
 #   BIND_PORT               dónde escucha el servidor, para comprobar que responde (8100)
 set -euo pipefail
@@ -13,7 +13,7 @@ _dir="${_script%/*}"
 [[ "$_dir" == "$_script" ]] && _dir="."
 APP_DIR="$(cd "$_dir" && pwd)"
 
-PORT="${CALENDAR_QUEMAOS_PORT:-9702}"
+PORT="${CALENDAR_QUEMAOS_PORT:-9705}"
 if ! [[ "$PORT" =~ ^97[0-9][0-9]$ ]]; then
     echo "CALENDAR_QUEMAOS_PORT debe estar entre 9700 y 9799 (es '$PORT')" >&2
     exit 1

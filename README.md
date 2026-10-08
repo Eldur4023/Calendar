@@ -57,7 +57,7 @@ Variables en `/etc/calendar/calendar.env`: `CALENDAR_DB`, `BIND_PORT`, `CALENDAR
 
 ## Estado para QuemaOS
 
-`calendar-quemaos.service` es un proceso aparte (Lux sólo abre un puerto por app) que escucha en `127.0.0.1:9702` y responde `GET /quemaos/status` con el contrato de la suite: `{quemaos, id: "calendar", name, status: ok|warn|error, message, metrics, extra}`. No toca la base al contestar: sirve lo último que midió un reloj interno (cada 30 s) y, si ese reloj se para, lo delata. Da `error` si el servidor no responde a `/healthz` o queda poco disco, y `warn` si va justo. El puerto va en `calendar.env` (`CALENDAR_QUEMAOS_PORT`, 9700-9799 — lo impone `quemaos-run.sh`) y `CALENDAR_QUEMAOS_HOST=0.0.0.0` la abre a la red. Código: [server/quemaos/app.lux](server/quemaos/app.lux). Sólo hace `SELECT`, pero el driver SQLite de Lux no tiene modo de sólo lectura, así que esa garantía es del código, no de la base.
+`calendar-quemaos.service` es un proceso aparte (Lux sólo abre un puerto por app) que escucha en `127.0.0.1:9705` y responde `GET /quemaos/status` con el contrato de la suite: `{quemaos, id: "calendar", name, status: ok|warn|error, message, metrics, extra}`. No toca la base al contestar: sirve lo último que midió un reloj interno (cada 30 s) y, si ese reloj se para, lo delata. Da `error` si el servidor no responde a `/healthz` o queda poco disco, y `warn` si va justo. El puerto va en `calendar.env` (`CALENDAR_QUEMAOS_PORT`, 9700-9799 — lo impone `quemaos-run.sh`) y `CALENDAR_QUEMAOS_HOST=0.0.0.0` la abre a la red. Código: [server/quemaos/app.lux](server/quemaos/app.lux). Sólo hace `SELECT`, pero el driver SQLite de Lux no tiene modo de sólo lectura, así que esa garantía es del código, no de la base.
 
 ## Escritorio
 
