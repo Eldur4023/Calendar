@@ -3,7 +3,8 @@ Type=Application
 Name=Calendar
 Comment=Tu calendario: eventos, series y avisos
 Exec=calendar-desktop
-Icon=calendar-desktop
+# Ruta absoluta: con el nombre "calendar-desktop", KDE puede caer al icono genérico del tema.
+Icon=/usr/share/icons/hicolor/256x256/apps/calendar-desktop.png
 Terminal=false
 Categories=Office;Calendar;
 Keywords=calendar;calendario;agenda;eventos;
