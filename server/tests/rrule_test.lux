@@ -1,0 +1,105 @@
+# Pruebas del módulo nativo `rrule` (recurrencias). Se ejecutan con
+#   lux test server/tests/rrule_test.lux
+
+import rrule
+import time
+import test
+
+app:
+    name "rrule-test"
+    port 8299
+
+# Milisegundos UTC de "2026-10-08T08:00:00Z".
+fn int t(string iso):
+    return time.parse_iso(iso)
+
+# Las repeticiones como texto ISO, para comparar a ojo.
+fn List<string> iso(List<int> ms):
+    List<string> out = []
+    for int m in ms:
+        out.add(time.format_iso(m))
+    return out
+
+fn List<string> expand(string rule, string start, string tz, string from, string to):
+    return iso(rrule.expand(rule, t(start), tz, [], t(from), t(to)))
+
+test "diaria con COUNT":
+    test.eq(expand("FREQ=DAILY;COUNT=3", "2026-10-08T08:00:00Z", "Europe/Madrid", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"),
+        ["2026-10-08T08:00:00Z", "2026-10-09T08:00:00Z", "2026-10-10T08:00:00Z"])
+
+test "semanal: la hora de pared se mantiene al cambiar de horario":
+    # Sáb 24 oct 10:00 CEST; el domingo 25 vuelve el horario de invierno: 10:00 CET es una hora más tarde en UTC.
+    test.eq(expand("FREQ=WEEKLY;COUNT=3", "2026-10-24T08:00:00Z", "Europe/Madrid", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"),
+        ["2026-10-24T08:00:00Z", "2026-10-31T09:00:00Z", "2026-11-07T09:00:00Z"])
+
+test "hora ambigua: la primera de las dos":
+    # 02:30 ocurre dos veces el 25-oct-2026 en Madrid (CEST y CET): se toma la primera, 00:30Z.
+    test.eq(expand("FREQ=DAILY;COUNT=3", "2026-10-24T00:30:00Z", "Europe/Madrid", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"),
+        ["2026-10-24T00:30:00Z", "2026-10-25T00:30:00Z", "2026-10-26T01:30:00Z"])
+
+test "la misma regla en UTC no cambia de hora":
+    test.eq(expand("FREQ=WEEKLY;COUNT=3", "2026-10-24T08:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"),
+        ["2026-10-24T08:00:00Z", "2026-10-31T08:00:00Z", "2026-11-07T08:00:00Z"])
+
+test "hora inexistente: se adelanta el hueco":
+    # 02:30 no existe el 29-mar-2026 en Madrid (de 02:00 a 03:00): sale a las 03:30 CEST = 01:30Z.
+    test.eq(expand("FREQ=DAILY;COUNT=4", "2026-03-27T01:30:00Z", "Europe/Madrid", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"),
+        ["2026-03-27T01:30:00Z", "2026-03-28T01:30:00Z", "2026-03-29T01:30:00Z", "2026-03-30T00:30:00Z"])
+
+test "mensual el 31 salta los meses que no lo tienen":
+    test.eq(expand("FREQ=MONTHLY;COUNT=4", "2026-01-31T12:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ["2026-01-31T12:00:00Z", "2026-03-31T12:00:00Z", "2026-05-31T12:00:00Z", "2026-07-31T12:00:00Z"])
+
+test "mensual: último viernes":
+    test.eq(expand("FREQ=MONTHLY;BYDAY=-1FR;COUNT=3", "2026-10-30T09:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ["2026-10-30T09:00:00Z", "2026-11-27T09:00:00Z", "2026-12-25T09:00:00Z"])
+
+test "mensual: segundo martes":
+    test.eq(expand("FREQ=MONTHLY;BYDAY=2TU;COUNT=2", "2026-10-13T09:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ["2026-10-13T09:00:00Z", "2026-11-10T09:00:00Z"])
+
+test "mensual: BYMONTHDAY negativo (último día)":
+    test.eq(expand("FREQ=MONTHLY;BYMONTHDAY=-1;COUNT=3", "2026-01-31T09:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ["2026-01-31T09:00:00Z", "2026-02-28T09:00:00Z", "2026-03-31T09:00:00Z"])
+
+test "anual el 29 de febrero":
+    test.eq(expand("FREQ=YEARLY;COUNT=2", "2024-02-29T09:00:00Z", "UTC", "2020-01-01T00:00:00Z", "2040-01-01T00:00:00Z"),
+        ["2024-02-29T09:00:00Z", "2028-02-29T09:00:00Z"])
+
+test "anual con BYMONTH":
+    test.eq(expand("FREQ=YEARLY;BYMONTH=3,9;COUNT=3", "2026-03-10T09:00:00Z", "UTC", "2020-01-01T00:00:00Z", "2040-01-01T00:00:00Z"),
+        ["2026-03-10T09:00:00Z", "2026-09-10T09:00:00Z", "2027-03-10T09:00:00Z"])
+
+test "semanal lunes y miércoles cada 2 semanas":
+    # Lunes 5 oct 2026 (semana 1), luego la semana 3: 19 y 21.
+    test.eq(expand("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=4", "2026-10-05T09:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ["2026-10-05T09:00:00Z", "2026-10-07T09:00:00Z", "2026-10-19T09:00:00Z", "2026-10-21T09:00:00Z"])
+
+test "UNTIL con fecha incluye todo ese día":
+    test.eq(expand("FREQ=DAILY;UNTIL=20261010", "2026-10-08T22:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ["2026-10-08T22:00:00Z", "2026-10-09T22:00:00Z", "2026-10-10T22:00:00Z"])
+
+test "UNTIL en UTC":
+    test.eq(expand("FREQ=DAILY;UNTIL=20261009T080000Z", "2026-10-08T08:00:00Z", "UTC", "2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ["2026-10-08T08:00:00Z", "2026-10-09T08:00:00Z"])
+
+test "EXDATE quita una repetición pero COUNT la cuenta":
+    List<int> got = rrule.expand("FREQ=DAILY;COUNT=3", t("2026-10-08T08:00:00Z"), "UTC", [t("2026-10-09T08:00:00Z")], t("2026-01-01T00:00:00Z"), t("2030-01-01T00:00:00Z"))
+    test.eq(iso(got), ["2026-10-08T08:00:00Z", "2026-10-10T08:00:00Z"])
+
+test "ventana y límite":
+    # Desde el 2020 pero pidiendo solo octubre de 2026.
+    test.eq(len(rrule.expand("FREQ=DAILY", t("2020-01-01T00:00:00Z"), "UTC", [], t("2026-10-01T00:00:00Z"), t("2026-11-01T00:00:00Z"))), 31)
+    test.eq(len(rrule.expand("FREQ=DAILY", t("2020-01-01T00:00:00Z"), "UTC", [], t("2020-01-01T00:00:00Z"), t("2030-01-01T00:00:00Z"), 5)), 5)
+
+test "regla sin días válidos termina":
+    test.eq(len(rrule.expand("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=31", t("2026-01-01T00:00:00Z"), "UTC", [], t("2026-01-01T00:00:00Z"), t("2300-01-01T00:00:00Z"))), 0)
+
+test "check rechaza lo que no soporta":
+    test.eq(rrule.check("FREQ=WEEKLY;BYDAY=MO,FR;COUNT=5"), "")
+    test.ok(rrule.check("FREQ=SECONDLY") != "")
+    test.ok(rrule.check("FREQ=MONTHLY;BYSETPOS=1") != "")
+    test.ok(rrule.check("INTERVAL=2") != "")
+    test.ok(rrule.check("FREQ=DAILY;COUNT=3;UNTIL=20261231") != "")
+    test.ok(rrule.check("FREQ=WEEKLY;BYDAY=1MO") != "")
+    test.ok(rrule.check("") != "")

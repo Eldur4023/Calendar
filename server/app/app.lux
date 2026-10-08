@@ -1,0 +1,43 @@
+# Calendar — servidor de calendario autoalojado, escrito en Lux.
+#
+#   CALENDAR_DB=./data/calendar.db lux ./server/app
+#
+# Servicio propio e independiente de Drive: su base de datos, sus usuarios y sus
+# tokens. Los clientes (la app de escritorio) hablan con la API JSON de
+# routes/api.lux. Todo el código está en lib/ (lógica) y routes/ (HTTP, órdenes).
+#
+# Variables de entorno (las lee run.sh desde /etc/calendar/calendar.env):
+#   CALENDAR_DB        fichero SQLite (obligatoria; se resuelve al compilar)
+#   CALENDAR_HOST      dirección de escucha (127.0.0.1: nginx es quien lo expone)
+#   CALENDAR_PROXY     1 si hay un proxy delante y se fía de X-Forwarded-For
+#   CALENDAR_TIMEZONE  zona de las fechas de los avisos del registro (Europe/Madrid)
+
+import sqlite
+import hash
+import time
+import json
+import os
+import regex
+import otp
+import rrule
+import text
+import net
+
+app:
+    name      "Calendar"
+    version   "1.0.0"
+    port      8100
+    host      env("CALENDAR_HOST", "127.0.0.1")
+    max_body  "1MB"
+
+    headers:
+        "Content-Security-Policy" "default-src 'none'"
+        "X-Content-Type-Options" "nosniff"
+
+    log:
+        level "info"
+        access false
+
+    sqlite:
+        file env("CALENDAR_DB")
+        pool 4

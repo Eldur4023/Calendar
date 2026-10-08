@@ -1,0 +1,117 @@
+# API JSON. Se autentica con `Authorization: Bearer <token>`; los errores salen
+# como {"detail": mensaje}. Ver README para el contrato de /api/ops.
+
+get endpoint("/healthz"):
+    return { "status": "ok" }
+
+on error:
+    int code = error.code
+    string detail = error.message
+    if code == 422 and len(error.messages) > 0:
+        detail = error.messages.join(" ")
+    if code >= 500:
+        log.error("error " + str(code) + " en " + request.method + " " + request.path + ": " + error.message)
+        detail = "Error interno."
+    return { "detail": detail }
+
+group("/api"):
+    # ── Sesión ──────────────────────────────────────────────────────────────
+
+    post endpoint("/login", Json body):
+        string ip = client_ip()
+        string username = sget(body, "username", "").trim().lower()
+        string password = sget(body, "password", "")
+        if username == "" or password == "":
+            return { "detail": "Indica usuario y contraseña." }.status(400)
+
+        # Ni la cuenta ni la IP pueden estar bloqueadas.
+        int wait = locked_for("user:" + username)
+        int wait_ip = locked_for("ip:" + ip)
+        if wait_ip > wait:
+            wait = wait_ip
+        if wait > 0:
+            return { "detail": "Demasiados intentos fallidos. Espera " + str(wait) + " segundos." }.status(429).header("Retry-After", str(wait))
+
+        Json user = await get_user_by_name(username)
+        # Con cuenta o sin ella se hace el mismo trabajo, para que el tiempo no delate cuál existe.
+        string stored = user == null ? str(state.get("dummy_hash", "")) : user["password_hash"]
+        bool ok = await hash.verify(password, stored) and user != null and user["is_active"] == 1
+        if ok and user["totp_secret"] != null:
+            string code = sget(body, "totp", "").trim().replace(" ", "")
+            if code == "":
+                return { "detail": "Introduce el código de verificación en dos pasos.", "totp_required": true }.status(401)
+            ok = otp.verify(user["totp_secret"], code)
+        if not ok:
+            register_failure("user:" + username)
+            register_failure("ip:" + ip)
+            await audit("login_failed", user == null ? null : user["id"], ip, username)
+            return { "detail": "Usuario o contraseña incorrectos." }.status(401)
+
+        clear_failures("user:" + username)
+        await sqlite.exec("update users set last_login_at = ? where id = ?", time.now(), user["id"])
+        string name = sget(body, "name", "Calendar").trim()
+        string token = await create_token(user["id"], name == "" ? "Calendar" : name.slice(0, 80), ["read", "write"])
+        await audit("login", user["id"], ip, name)
+        return { "token": token, "user": { "id": user["id"], "username": user["username"] } }
+
+    get endpoint("/me"):
+        Json a = await need_user("read")
+        return { "id": a["user"]["id"], "username": a["user"]["username"], "rev": a["user"]["rev"], "scopes": parse_json_text(a["token"]["scopes"], []) }
+
+    post endpoint("/logout"):
+        Json a = await need_user("read")
+        await sqlite.exec("update api_tokens set revoked = 1 where id = ?", a["token"]["id"])
+        return { "ok": true }
+
+    get endpoint("/tokens"):
+        Json a = await need_user("read")
+        List<Json> out = []
+        for Json t in await sqlite.query("select id, name, created_at, last_used_at from api_tokens where user_id = ? and revoked = 0 order by created_at", a["user"]["id"]):
+            t["current"] = t["id"] == a["token"]["id"]
+            out.add(t)
+        return { "tokens": out }
+
+    delete endpoint("/tokens/:token_id", string token_id):
+        Json a = await need_user("write")
+        await sqlite.exec("update api_tokens set revoked = 1 where id = ? and user_id = ?", token_id, a["user"]["id"])
+        return { "ok": true }
+
+    # ── Calendario ──────────────────────────────────────────────────────────
+
+    # Lo que ha cambiado desde `since` (0 = todo lo vivo). Con `more` hay que volver a
+    # pedir desde el `rev` devuelto; con `reset` el cliente debe tirar su copia local.
+    get endpoint("/changes", long since = 0):
+        Json a = await need_user("read")
+        # Releer al usuario: su contador puede haber avanzado desde que se cargó para autenticar.
+        Json user = await get_user(a["user"]["id"])
+        return await changes_since(user, since, 500)
+
+    # Lote de operaciones: {"run": "...", "ops": [{"op": "event.put", "key": "1", ...}]}.
+    post endpoint("/ops", Json body):
+        Json a = await need_user("write")
+        if not body.has("ops") or len(body["ops"]) == 0:
+            return { "detail": "Falta la lista de operaciones." }.status(400)
+        if len(body["ops"]) > 1000:
+            return { "detail": "Como mucho 1000 operaciones por lote." }.status(413)
+        List<Json> results = await apply_ops(a["user"]["id"], body["ops"])
+        Json user = await get_user(a["user"]["id"])
+        return { "run": sget(body, "run", ""), "rev": user["rev"], "results": results }
+
+    # Apariciones ya expandidas entre `after` y `before` (ms UTC); `calendars` es una lista
+    # de ids separados por comas (todos si falta).
+    get endpoint("/occurrences", long after, long before, string calendars = ""):
+        Json a = await need_user("read")
+        if before <= after or before - after > 400 * 86400000:
+            return { "detail": "El intervalo debe ser positivo y de como mucho 400 días." }.status(400)
+        string uid = a["user"]["id"]
+        List<Json> rows = await sqlite.query(
+            "select e.* from events e join calendars c on c.id = e.calendar_id where e.user_id = ? and e.deleted_at is null and c.deleted_at is null and e.start_ms < ? and (e.rrule <> '' or e.end_ms > ?)",
+            uid, before, after)
+        if calendars != "":
+            List<Json> kept = []
+            List<string> wanted = calendars.split(",")
+            for Json r in rows:
+                if wanted.contains(r["calendar_id"]):
+                    kept.add(r)
+            rows = kept
+        return { "occurrences": occurrences_of(rows, after, before, 5000) }

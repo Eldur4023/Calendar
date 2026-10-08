@@ -1,0 +1,103 @@
+# Cuentas, tokens de API y protección del login.
+#
+# Los clientes inician sesión una vez (POST /api/login) y reciben un token de API;
+# a partir de ahí todo va con `Authorization: Bearer <token>`. El token sólo
+# existe en claro en esa respuesta: en la base se guarda su hash.
+
+# ── IP del cliente ──────────────────────────────────────────────────────────
+
+fn bool is_loopback(string ip):
+    return ip == "127.0.0.1" or ip == "::1" or ip.starts_with("::ffff:127.")
+
+# Lux sólo escucha en el bucle local (nginx es el único que llega), así que si el
+# salto inmediato es local, X-Forwarded-For lo ha puesto nuestro proxy: se usa el
+# último elemento (el que añadió él), no los anteriores, que escribe el cliente.
+fn string client_ip():
+    string peer = request.ip
+    if not is_loopback(peer) or os.getenv("CALENDAR_PROXY", "1") != "1":
+        return peer
+    string fwd = header("X-Forwarded-For", "")
+    if fwd == "":
+        return peer
+    List<string> parts = fwd.split(",")
+    string last = parts[len(parts) - 1].trim()
+    return net.ip_version(last) == null ? peer : last
+
+# ── Contraseñas y tokens ────────────────────────────────────────────────────
+
+fn string hash_token(string token):
+    return hash.sha256(token)
+
+# Incumplimientos de la política; lista vacía si la contraseña vale.
+fn List<string> check_password_policy(string password, string username):
+    List<string> errors = []
+    if len(password) < 10:
+        errors.add("Debe tener al menos 10 caracteres.")
+    if password.lower() == password:
+        errors.add("Debe incluir al menos una mayúscula.")
+    if password.upper() == password:
+        errors.add("Debe incluir al menos una minúscula.")
+    if not regex.test("[0-9]", password):
+        errors.add("Debe incluir al menos un dígito.")
+    if len(username) >= 3 and password.lower().contains(username.lower()):
+        errors.add("No puede contener el nombre de usuario.")
+    return errors
+
+# ── Bloqueo por intentos fallidos ───────────────────────────────────────────
+# En memoria: se pierde al reiniciar y no se comparte entre procesos (Calendar
+# corre en uno solo). 5 fallos en 15 minutos bloquean 30 minutos, por cuenta y
+# por IP; el bloqueo por IP evita que probar muchas cuentas salga gratis.
+
+fn int locked_for(string key):
+    long until = state.get("lock:" + key, 0)
+    long left = until - time.now()
+    return left > 0 ? int((left + 999) / 1000) : 0
+
+fn bool register_failure(string key):
+    int n = state.hit("fail:" + key, 15 * 60 * 1000)
+    if n >= 5:
+        state.set("lock:" + key, time.now() + 30 * 60 * 1000)
+    return true
+
+fn bool clear_failures(string key):
+    state.remove("fail:" + key)
+    state.remove("lock:" + key)
+    return true
+
+# ── Tokens de API ───────────────────────────────────────────────────────────
+
+fn Json load_api_token(string raw):
+    Json t = first(await sqlite.query("select * from api_tokens where token_hash = ?", hash_token(raw)))
+    if t == null or t["revoked"] == 1:
+        return null
+    if t["expires_at"] != null and t["expires_at"] <= time.now():
+        return null
+    # Una escritura por minuto como mucho: no por cada petición de sondeo.
+    if t["last_used_at"] == null or time.now() - t["last_used_at"] > 60000:
+        await sqlite.exec("update api_tokens set last_used_at = ? where id = ?", time.now(), t["id"])
+    return t
+
+# Usuario autenticado por token con el ámbito pedido, o corta con 401/403.
+# Devuelve {"user": fila, "token": fila}.
+fn Json need_user(string scope):
+    string authorization = header("Authorization", "")
+    if not authorization.lower().starts_with("bearer "):
+        abort(401, "Falta el token de acceso.")
+    Json t = await load_api_token(authorization.slice(7).trim())
+    if t == null:
+        abort(401, "Token no válido, caducado o revocado.")
+    Json user = await get_user(t["user_id"])
+    if user == null or user["is_active"] != 1:
+        abort(401, "La cuenta no está activa.")
+    Json scopes = parse_json_text(t["scopes"], [])
+    if not scopes.contains(scope):
+        abort(403, "El token no tiene el ámbito «" + scope + "».")
+    return { "user": user, "token": t }
+
+# Crea un token y devuelve el texto en claro (la única vez que existe).
+fn string create_token(string uid, string name, Json scopes):
+    string raw = hash.token(32)
+    await sqlite.exec(
+        "insert into api_tokens (id, user_id, name, token_hash, scopes, created_at) values (?, ?, ?, ?, ?, ?)",
+        new_id(), uid, name, hash_token(raw), json.stringify(scopes), time.now())
+    return raw

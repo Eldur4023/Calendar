@@ -1,0 +1,37 @@
+# Limpieza periódica, dentro del propio proceso (sin cron).
+
+# Lo borrado se conserva 30 días para que los clientes que llevan tiempo sin
+# conectar todavía reciban el borrado; pasado ese plazo se purga. Un cliente que
+# lleve más de 30 días sin sincronizar debe volver a bajarlo todo (ver /api/changes).
+fn int tombstone_days():
+    return 30
+
+fn Json maintenance_run():
+    long cutoff = time.now() - tombstone_days() * 86400000
+    Json result = {}
+    # Se anota hasta qué revisión se han purgado borrados: un cliente que esté por
+    # detrás de ella ya no puede fiarse de `changes` y tiene que volver a bajarlo todo.
+    await sqlite.exec("""
+        update users set purged_rev = max(purged_rev, coalesce((
+            select max(rev) from (
+                select rev from events where user_id = users.id and deleted_at is not null and deleted_at < ?
+                union all
+                select rev from calendars where user_id = users.id and deleted_at is not null and deleted_at < ?
+            )), 0))
+        """, cutoff, cutoff)
+    result["events"] = await sqlite.exec("delete from events where deleted_at is not null and deleted_at < ?", cutoff)
+    result["calendars"] = await sqlite.exec("delete from calendars where deleted_at is not null and deleted_at < ?", cutoff)
+    result["tokens"] = await sqlite.exec("delete from api_tokens where revoked = 1 or (expires_at is not null and expires_at < ?)", time.now())
+    result["audit"] = await sqlite.exec("delete from audit where at < ?", time.now() - 180 * 86400000)
+    return result
+
+every "1h":
+    try:
+        Json r = await maintenance_run()
+        int total = 0
+        for string k in r:
+            total = total + r[k]
+        if total > 0:
+            log.info("mantenimiento: " + json.stringify(r))
+    catch e:
+        log.error("fallo en la tarea de mantenimiento: " + e.message)

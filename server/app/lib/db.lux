@@ -1,0 +1,149 @@
+# Esquema, migraciones y consultas de uso común.
+#
+# Las marcas de tiempo son INTEGER en milisegundos UTC, los booleanos 0/1 y las
+# listas (exdates, reminders, scopes) texto JSON. Los ids de calendarios y eventos
+# los pone el cliente (uuid): así crear algo es idempotente y se puede reintentar.
+#
+# MIGRACIONES. `migrations()` es una lista de versiones: la posición N lista las
+# sentencias que llevan el esquema de la versión N a la N+1. Al arrancar se
+# aplican, en orden, las que superan a `schema_version`. Para cambiar el esquema
+# se AÑADE una versión al final; nunca se edita una anterior.
+
+fn List<Json> migrations():
+    return [
+        [
+            """
+            create table users (
+                id text primary key,
+                username text not null unique,
+                password_hash text not null,
+                totp_secret text,
+                is_active integer not null default 1,
+                created_at integer not null,
+                last_login_at integer,
+                rev integer not null default 0,
+                purged_rev integer not null default 0
+            )
+            """,
+            """
+            create table api_tokens (
+                id text primary key,
+                user_id text not null,
+                name text not null,
+                token_hash text not null unique,
+                scopes text not null default '["read","write"]',
+                created_at integer not null,
+                last_used_at integer,
+                expires_at integer,
+                revoked integer not null default 0
+            )
+            """,
+            "create index ix_api_tokens_user on api_tokens (user_id)",
+            """
+            create table calendars (
+                id text primary key,
+                user_id text not null,
+                name text not null,
+                color text not null,
+                position integer not null default 0,
+                rev integer not null,
+                updated_at integer not null,
+                deleted_at integer
+            )
+            """,
+            "create index ix_calendars_rev on calendars (user_id, rev)",
+            """
+            create table events (
+                id text primary key,
+                user_id text not null,
+                calendar_id text not null,
+                master_id text,
+                title text not null default '',
+                location text not null default '',
+                notes text not null default '',
+                start_ms integer not null,
+                end_ms integer not null,
+                all_day integer not null default 0,
+                tzid text not null default 'UTC',
+                rrule text not null default '',
+                exdates text not null default '[]',
+                reminders text not null default '[]',
+                rev integer not null,
+                updated_at integer not null,
+                deleted_at integer
+            )
+            """,
+            "create index ix_events_rev on events (user_id, rev)",
+            "create index ix_events_start on events (user_id, start_ms)",
+            "create index ix_events_cal on events (calendar_id)",
+            "create index ix_events_master on events (master_id)",
+            """
+            create table audit (
+                id integer primary key autoincrement,
+                at integer not null,
+                event text not null,
+                user_id text,
+                ip text,
+                detail text
+            )
+            """
+        ]
+    ]
+
+# Crea el esquema y aplica las migraciones pendientes. Lux retiene las
+# peticiones (503) hasta que termina.
+on start:
+    await sqlite.exec("create table if not exists schema_version (version integer not null)")
+    List<Json> v = await sqlite.query("select version from schema_version")
+    int current = 0
+    if len(v) == 0:
+        await sqlite.exec("insert into schema_version (version) values (0)")
+    else:
+        current = v[0]["version"]
+    List<Json> all = migrations()
+    while current < len(all):
+        await sqlite.begin()
+        for string ddl in all[current]:
+            await sqlite.exec(ddl)
+        current = current + 1
+        await sqlite.exec("update schema_version set version = ?", current)
+        await sqlite.commit()
+        log.info("esquema migrado a la versión " + str(current))
+    # Para que un usuario desconocido tarde en el login lo mismo que uno conocido.
+    state.set("dummy_hash", await hash.argon2("contraseña-que-nadie-tiene"))
+    log.info("Calendar listo (esquema v" + str(current) + ")")
+
+fn Json first(List<Json> rows):
+    return len(rows) == 0 ? null : rows[0]
+
+fn string new_id():
+    return hash.uuid().replace("-", "")
+
+# JSON guardado como texto -> valor. Un texto vacío o inválido da el valor por defecto.
+fn Json parse_json_text(Json raw, Json fallback):
+    if raw == null or raw == "":
+        return fallback
+    try:
+        return json.parse(raw)
+    catch e:
+        return fallback
+
+fn Json get_user(Json id):
+    if id == null:
+        return null
+    return first(await sqlite.query("select * from users where id = ?", id))
+
+fn Json get_user_by_name(string username):
+    return first(await sqlite.query("select * from users where username = ?", username))
+
+# Siguiente número de revisión del usuario. Cada cambio de un calendario o de un
+# evento tiene el suyo, único: es el cursor con el que los clientes piden «lo nuevo».
+fn long next_rev(string uid):
+    await sqlite.exec("update users set rev = rev + 1 where id = ?", uid)
+    List<Json> r = await sqlite.query("select rev from users where id = ?", uid)
+    return r[0]["rev"]
+
+fn bool audit(string event, Json uid, string ip, string detail):
+    await sqlite.exec("insert into audit (at, event, user_id, ip, detail) values (?, ?, ?, ?, ?)",
+        time.now(), event, uid, ip == "" ? null : ip, detail)
+    return true

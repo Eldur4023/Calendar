@@ -1,0 +1,308 @@
+# Calendarios y eventos: validación, escritura por lotes y lectura.
+#
+# Un evento guarda su inicio y fin como instantes UTC (ms) más la zona `tzid` en
+# la que se creó, que es la que usan las repeticiones para conservar la hora de
+# pared al cambiar de horario. Los eventos de todo el día usan siempre tzid UTC y
+# empiezan en la medianoche UTC del día: así son el mismo día en cualquier zona; su
+# fin es la medianoche UTC siguiente al último día (exclusivo).
+#
+# Una repetición editada «solo esta vez» es un evento aparte con `master_id` (el de
+# la serie), y la serie guarda en `exdates` el inicio original que sustituye.
+
+fn Json cal_view(Json r):
+    return {
+        "id": r["id"], "name": r["name"], "color": r["color"], "position": r["position"],
+        "rev": r["rev"], "updated_at": r["updated_at"], "deleted": r["deleted_at"] != null
+    }
+
+fn Json event_view(Json r):
+    return {
+        "id": r["id"], "calendar_id": r["calendar_id"], "master_id": r["master_id"],
+        "title": r["title"], "location": r["location"], "notes": r["notes"],
+        "start": r["start_ms"], "end": r["end_ms"], "all_day": r["all_day"] == 1,
+        "tzid": r["tzid"], "rrule": r["rrule"] == "" ? null : r["rrule"],
+        "exdates": parse_json_text(r["exdates"], []), "reminders": parse_json_text(r["reminders"], []),
+        "rev": r["rev"], "updated_at": r["updated_at"], "deleted": r["deleted_at"] != null
+    }
+
+# ── Entrada ─────────────────────────────────────────────────────────────────
+
+# El valor de `k` como texto, o `d` si falta o es null.
+fn string sget(Json o, string k, string d):
+    return o.has(k) and o[k] != null ? str(o[k]) : d
+
+fn bool is_whole(Json v):
+    return v != null and regex.test("^-?[0-9]{1,15}$", str(v))
+
+fn bool is_id(string s):
+    return regex.test("^[A-Za-z0-9_-]{8,64}$", s)
+
+fn bool valid_tz(string tzid):
+    try:
+        time.format(0, "%Y", tzid)
+        return true
+    catch e:
+        return false
+
+fn Json fail(string key, string why):
+    return { "key": key, "ok": false, "error": why }
+
+fn Json conflict(string key, Json current):
+    return { "key": key, "ok": false, "conflict": true, "current": current }
+
+fn Json done(string key, long rev, bool changed):
+    return { "key": key, "ok": true, "rev": rev, "unchanged": not changed }
+
+# ¿Es el cambio anterior al estado del servidor? (base_rev lo manda el cliente)
+fn bool is_stale(Json op, Json cur):
+    return op.has("base_rev") and is_whole(op["base_rev"]) and int(op["base_rev"]) < cur["rev"]
+
+# ── Calendarios ─────────────────────────────────────────────────────────────
+
+fn Json put_calendar(string uid, Json op):
+    string key = sget(op, "key", "")
+    string id = sget(op, "id", "")
+    string name = sget(op, "name", "").trim()
+    string color = sget(op, "color", "#d97757").lower()
+    if not is_id(id):
+        return fail(key, "id no válido")
+    if name == "" or len(name) > 100:
+        return fail(key, "el nombre debe tener entre 1 y 100 caracteres")
+    if not regex.test("^#[0-9a-f]{6}$", color):
+        return fail(key, "el color debe ser #rrggbb")
+    int position = 0
+    if op.has("position") and op["position"] != null:
+        if not is_whole(op["position"]):
+            return fail(key, "position debe ser un entero")
+        position = int(op["position"])
+
+    Json cur = first(await sqlite.query("select * from calendars where id = ?", id))
+    if cur != null and cur["user_id"] != uid:
+        return fail(key, "id en uso")
+    if cur != null and cur["deleted_at"] == null and cur["name"] == name and cur["color"] == color and cur["position"] == position:
+        return done(key, cur["rev"], false)
+    if cur != null and is_stale(op, cur):
+        return conflict(key, cal_view(cur))
+
+    long rev = await next_rev(uid)
+    long now = time.now()
+    if cur == null:
+        await sqlite.exec("insert into calendars (id, user_id, name, color, position, rev, updated_at) values (?, ?, ?, ?, ?, ?, ?)",
+            id, uid, name, color, position, rev, now)
+    else:
+        # Volver a poner un calendario borrado lo «resucita»; sus eventos siguen borrados.
+        await sqlite.exec("update calendars set name = ?, color = ?, position = ?, rev = ?, updated_at = ?, deleted_at = null where id = ?",
+            name, color, position, rev, now, id)
+    return done(key, rev, true)
+
+fn Json delete_calendar(string uid, Json op):
+    string key = sget(op, "key", "")
+    string id = sget(op, "id", "")
+    Json cur = first(await sqlite.query("select * from calendars where id = ? and user_id = ?", id, uid))
+    if cur == null or cur["deleted_at"] != null:
+        return done(key, cur == null ? 0 : cur["rev"], false)
+    if is_stale(op, cur):
+        return conflict(key, cal_view(cur))
+    long now = time.now()
+    # Los eventos del calendario se borran con él, cada uno con su revisión: así los
+    # demás clientes se enteran de cada uno.
+    for Json e in await sqlite.query("select id from events where calendar_id = ? and deleted_at is null", id):
+        long erev = await next_rev(uid)
+        await sqlite.exec("update events set deleted_at = ?, rev = ?, updated_at = ? where id = ?", now, erev, now, e["id"])
+    long rev = await next_rev(uid)
+    await sqlite.exec("update calendars set deleted_at = ?, rev = ?, updated_at = ? where id = ?", now, rev, now, id)
+    return done(key, rev, true)
+
+# ── Eventos ─────────────────────────────────────────────────────────────────
+
+fn Json put_event(string uid, Json op):
+    string key = sget(op, "key", "")
+    string id = sget(op, "id", "")
+    string calendar_id = sget(op, "calendar_id", "")
+    string master_id = sget(op, "master_id", "")
+    string title = sget(op, "title", "").trim()
+    string location = sget(op, "location", "").trim()
+    string notes = sget(op, "notes", "")
+    string tzid = sget(op, "tzid", "UTC")
+    string rule = sget(op, "rrule", "").trim()
+    bool all_day = op.has("all_day") and op["all_day"] == true
+
+    if not is_id(id):
+        return fail(key, "id no válido")
+    if len(title) > 500 or len(location) > 500 or len(notes) > 20000:
+        return fail(key, "título, lugar o notas demasiado largos")
+    if not is_whole(op["start"]) or not is_whole(op["end"]):
+        return fail(key, "start y end deben ser milisegundos UTC (enteros)")
+    long start = int(op["start"])
+    long end = int(op["end"])
+    if end < start:
+        return fail(key, "el evento no puede acabar antes de empezar")
+    if end - start > 366 * 86400000:
+        return fail(key, "un evento no puede durar más de un año")
+    if all_day:
+        tzid = "UTC"
+        if start % 86400000 != 0 or end % 86400000 != 0 or end == start:
+            return fail(key, "un evento de todo el día empieza y acaba en medianoches UTC y dura al menos un día")
+    if not valid_tz(tzid):
+        return fail(key, "zona horaria desconocida: " + tzid)
+    if rule != "":
+        string why = rrule.check(rule)
+        if why != "":
+            return fail(key, why)
+        if master_id != "":
+            return fail(key, "una excepción de una serie no puede repetirse a su vez")
+
+    List<int> exdates = []
+    if op.has("exdates") and op["exdates"] != null:
+        if len(op["exdates"]) > 2000:
+            return fail(key, "demasiadas excepciones")
+        for Json x in op["exdates"]:
+            if not is_whole(x):
+                return fail(key, "exdates debe ser una lista de milisegundos UTC")
+            exdates.add(int(x))
+    List<int> reminders = []
+    if op.has("reminders") and op["reminders"] != null:
+        if len(op["reminders"]) > 10:
+            return fail(key, "como mucho 10 avisos")
+        for Json m in op["reminders"]:
+            if not is_whole(m) or int(m) < 0 or int(m) > 40320:
+                return fail(key, "los avisos son minutos entre 0 y 40320 (4 semanas)")
+            reminders.add(int(m))
+
+    Json cal = first(await sqlite.query("select id from calendars where id = ? and user_id = ? and deleted_at is null", calendar_id, uid))
+    if cal == null:
+        return fail(key, "el calendario no existe")
+    if master_id != "":
+        Json master = first(await sqlite.query("select id, rrule from events where id = ? and user_id = ? and deleted_at is null", master_id, uid))
+        if master == null or master["rrule"] == "":
+            return fail(key, "la serie de esta excepción no existe")
+
+    string ex_text = json.stringify(exdates)
+    string rem_text = json.stringify(reminders)
+    Json cur = first(await sqlite.query("select * from events where id = ?", id))
+    if cur != null and cur["user_id"] != uid:
+        return fail(key, "id en uso")
+    # ¿Ya está así? Repetir un lote no debe subir revisiones ni molestar a los demás clientes.
+    bool same = cur != null and cur["deleted_at"] == null
+    if same:
+        same = cur["calendar_id"] == calendar_id and cur["title"] == title and cur["location"] == location and cur["notes"] == notes
+    if same:
+        same = cur["start_ms"] == start and cur["end_ms"] == end and cur["all_day"] == (all_day ? 1 : 0) and cur["tzid"] == tzid
+    if same:
+        same = cur["rrule"] == rule and cur["exdates"] == ex_text and cur["reminders"] == rem_text
+    if same:
+        same = (cur["master_id"] == null ? "" : cur["master_id"]) == master_id
+    if same:
+        return done(key, cur["rev"], false)
+    if cur != null and is_stale(op, cur):
+        return conflict(key, event_view(cur))
+
+    long rev = await next_rev(uid)
+    long now = time.now()
+    Json mid = master_id == "" ? null : master_id
+    if cur == null:
+        await sqlite.exec(
+            "insert into events (id, user_id, calendar_id, master_id, title, location, notes, start_ms, end_ms, all_day, tzid, rrule, exdates, reminders, rev, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            id, uid, calendar_id, mid, title, location, notes, start, end, all_day ? 1 : 0, tzid, rule, ex_text, rem_text, rev, now)
+    else:
+        await sqlite.exec(
+            "update events set calendar_id = ?, master_id = ?, title = ?, location = ?, notes = ?, start_ms = ?, end_ms = ?, all_day = ?, tzid = ?, rrule = ?, exdates = ?, reminders = ?, rev = ?, updated_at = ?, deleted_at = null where id = ?",
+            calendar_id, mid, title, location, notes, start, end, all_day ? 1 : 0, tzid, rule, ex_text, rem_text, rev, now, id)
+    return done(key, rev, true)
+
+fn Json delete_event(string uid, Json op):
+    string key = sget(op, "key", "")
+    string id = sget(op, "id", "")
+    Json cur = first(await sqlite.query("select * from events where id = ? and user_id = ?", id, uid))
+    if cur == null or cur["deleted_at"] != null:
+        return done(key, cur == null ? 0 : cur["rev"], false)
+    if is_stale(op, cur):
+        return conflict(key, event_view(cur))
+    long now = time.now()
+    # Borrar una serie borra también sus excepciones.
+    for Json e in await sqlite.query("select id from events where master_id = ? and deleted_at is null", id):
+        long erev = await next_rev(uid)
+        await sqlite.exec("update events set deleted_at = ?, rev = ?, updated_at = ? where id = ?", now, erev, now, e["id"])
+    long rev = await next_rev(uid)
+    await sqlite.exec("update events set deleted_at = ?, rev = ?, updated_at = ? where id = ?", now, rev, now, id)
+    return done(key, rev, true)
+
+# Aplica un lote en una transacción. Cada operación se valida entera antes de tocar
+# nada y devuelve su resultado: un fallo no corta el resto.
+fn List<Json> apply_ops(string uid, List<Json> ops):
+    List<Json> results = []
+    await sqlite.begin()
+    for Json op in ops:
+        string key = sget(op, "key", "")
+        switch sget(op, "op", ""):
+            case "cal.put":
+                results.add(await put_calendar(uid, op))
+            case "cal.delete":
+                results.add(await delete_calendar(uid, op))
+            case "event.put":
+                results.add(await put_event(uid, op))
+            case "event.delete":
+                results.add(await delete_event(uid, op))
+            else:
+                results.add(fail(key, "operación desconocida: " + sget(op, "op", "")))
+    await sqlite.commit()
+    return results
+
+# ── Lectura ─────────────────────────────────────────────────────────────────
+
+# Lo que ha cambiado desde la revisión `since`, con borrados incluidos. Si hay más de
+# `page` filas se corta en una frontera de revisión (todas son únicas) y `more` avisa.
+fn Json changes_since(Json user, long since, int page):
+    string uid = user["id"]
+    if since > 0 and since < user["purged_rev"]:
+        # Se han purgado borrados que este cliente no llegó a ver.
+        return { "reset": true, "rev": user["rev"], "more": false, "calendars": [], "events": [] }
+    # Desde cero no hay nada que borrar: se omiten las lápidas.
+    int tombstones = since == 0 ? 0 : 1
+    List<Json> cals = await sqlite.query("select * from calendars where user_id = ? and rev > ? and (? = 1 or deleted_at is null) order by rev limit ?", uid, since, tombstones, page + 1)
+    List<Json> evs = await sqlite.query("select * from events where user_id = ? and rev > ? and (? = 1 or deleted_at is null) order by rev limit ?", uid, since, tombstones, page + 1)
+    long upto = user["rev"]
+    bool more = false
+    if len(cals) > page:
+        upto = cals[page - 1]["rev"]
+        more = true
+    if len(evs) > page and evs[page - 1]["rev"] < upto:
+        upto = evs[page - 1]["rev"]
+        more = true
+    List<Json> out_cals = []
+    for Json c in cals:
+        if c["rev"] <= upto:
+            out_cals.add(cal_view(c))
+    List<Json> out_evs = []
+    for Json e in evs:
+        if e["rev"] <= upto:
+            out_evs.add(event_view(e))
+    return { "reset": false, "rev": upto, "more": more, "calendars": out_cals, "events": out_evs }
+
+# Las apariciones de los eventos que se solapan con [after, before): las series ya
+# expandidas, cada aparición con el `instance` (su inicio) como identificador.
+# `rows` son filas de events; las excepciones (master_id) salen como eventos sueltos.
+fn List<Json> occurrences_of(List<Json> rows, long after, long before, int limit):
+    List<Json> out = []
+    for Json r in rows:
+        long dur = r["end_ms"] - r["start_ms"]
+        if r["rrule"] == "":
+            if r["start_ms"] < before and r["end_ms"] > after:
+                Json o = event_view(r)
+                o["instance"] = r["start_ms"]
+                o["recurring"] = false
+                out.add(o)
+        else:
+            # Una repetición que empieza antes de `after` puede seguir en curso.
+            List<int> starts = rrule.expand(r["rrule"], r["start_ms"], r["tzid"], parse_json_text(r["exdates"], []), after - dur, before, limit)
+            for int s in starts:
+                if s + dur > after:
+                    Json o = event_view(r)
+                    o["start"] = s
+                    o["end"] = s + dur
+                    o["instance"] = s
+                    o["recurring"] = true
+                    out.add(o)
+        if len(out) >= limit:
+            break
+    return out

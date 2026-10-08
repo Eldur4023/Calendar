@@ -1,0 +1,115 @@
+# Órdenes de administración, para `lux run server/app -- <orden> [args]` (el
+# envoltorio instalado es deploy/calendar-cli.sh). Corren con todo el proyecto a
+# mano —lib/, la base de datos, `on start:`— y sin escuchar en ningún puerto.
+
+# Valor de una opción --nombre en los argumentos, o `fallback`.
+fn string option(List<string> args, string name, string fallback):
+    int i = 0
+    while i < len(args) - 1:
+        if args[i] == name:
+            return args[i + 1]
+        i = i + 1
+    return fallback
+
+# Contraseña de --password o, si falta, pedida dos veces sin eco.
+fn string ask_password(List<string> args):
+    string given = option(args, "--password", "")
+    if given != "":
+        return given
+    while true:
+        string p1 = await os.input_secret("Contraseña: ")
+        string p2 = await os.input_secret("Repite la contraseña: ")
+        if p1 == p2:
+            return p1
+        os.eprint("No coinciden.")
+    return ""
+
+command "createuser":
+    List<string> a = os.argv()
+    if len(a) < 1:
+        os.eprint("uso: createuser NOMBRE [--password P]")
+        os.exit(2)
+    string username = a[0].trim().lower()
+    if not regex.test("^[a-z0-9._-]+$", username) or len(username) < 3:
+        os.eprint("Nombre de usuario no válido (3 o más letras, números, punto, guion o guion bajo).")
+        os.exit(1)
+    if await get_user_by_name(username) != null:
+        os.eprint("El usuario '" + username + "' ya existe.")
+        os.exit(1)
+    string password = await ask_password(a)
+    List<string> problems = check_password_policy(password, username)
+    if len(problems) > 0:
+        os.eprint(problems.join(" "))
+        os.exit(1)
+    await sqlite.exec("insert into users (id, username, password_hash, created_at) values (?, ?, ?, ?)",
+        new_id(), username, await hash.argon2(password), time.now())
+    os.print("Usuario '" + username + "' creado.")
+
+command "passwd":
+    List<string> a = os.argv()
+    if len(a) < 1:
+        os.eprint("uso: passwd NOMBRE [--password P]")
+        os.exit(2)
+    Json user = await get_user_by_name(a[0].trim().lower())
+    if user == null:
+        os.eprint("No existe '" + a[0] + "'.")
+        os.exit(1)
+    string password = await ask_password(a)
+    List<string> problems = check_password_policy(password, user["username"])
+    if len(problems) > 0:
+        os.eprint(problems.join(" "))
+        os.exit(1)
+    await sqlite.exec("update users set password_hash = ? where id = ?", await hash.argon2(password), user["id"])
+    # Una contraseña nueva cierra todas las sesiones abiertas.
+    await sqlite.exec("update api_tokens set revoked = 1 where user_id = ?", user["id"])
+    os.print("Contraseña actualizada; se han cerrado las sesiones abiertas.")
+
+command "listusers":
+    List<Json> rows = await sqlite.query("select * from users order by username")
+    if len(rows) == 0:
+        os.print("No hay usuarios.")
+    for Json u in rows:
+        string state_name = u["is_active"] == 1 ? "activo" : "desactivado"
+        string tf = u["totp_secret"] == null ? "sin 2FA" : "con 2FA"
+        os.print(text.pad_right(u["username"], 20, " ") + " " + text.pad_right(state_name, 12, " ") + " " + tf)
+
+# Activa el segundo factor y muestra el secreto y la dirección otpauth:// (la que
+# lee una app de autenticación; con `qrencode` instalado se puede convertir en QR).
+command "totp":
+    List<string> a = os.argv()
+    if len(a) < 1:
+        os.eprint("uso: totp NOMBRE [--off]")
+        os.exit(2)
+    Json user = await get_user_by_name(a[0].trim().lower())
+    if user == null:
+        os.eprint("No existe '" + a[0] + "'.")
+        os.exit(1)
+    if a.contains("--off"):
+        await sqlite.exec("update users set totp_secret = null where id = ?", user["id"])
+        os.print("2FA desactivado.")
+    else:
+        string secret = otp.new_secret()
+        await sqlite.exec("update users set totp_secret = ? where id = ?", secret, user["id"])
+        os.print("Secreto:  " + secret)
+        os.print("Dirección: " + otp.uri(secret, user["username"], "Calendar"))
+        os.print("Añádelo a la app de autenticación; el login pedirá el código desde ahora.")
+
+command "disable":
+    List<string> a = os.argv()
+    if len(a) < 1:
+        os.eprint("uso: disable NOMBRE")
+        os.exit(2)
+    Json user = await get_user_by_name(a[0].trim().lower())
+    if user == null:
+        os.eprint("No existe '" + a[0] + "'.")
+        os.exit(1)
+    await sqlite.exec("update users set is_active = 0 where id = ?", user["id"])
+    await sqlite.exec("update api_tokens set revoked = 1 where user_id = ?", user["id"])
+    os.print("Cuenta desactivada y sesiones cerradas.")
+
+command "maintenance":
+    Json result = await maintenance_run()
+    List<string> parts = []
+    for string k in result:
+        parts.add(k + "=" + str(result[k]))
+    os.print(parts.join(", "))

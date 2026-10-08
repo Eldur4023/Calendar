@@ -1,0 +1,309 @@
+# Pruebas de extremo a extremo de la API de Calendar, contra una instancia real.
+#
+#   server/tests/run.sh
+#
+# (lux test arranca el servidor en un puerto libre; la base de datos es la de
+# CALENDAR_DB, que run.sh pone en un directorio temporal.)
+
+import http
+import test
+
+fn string url(string path):
+    return test.base_url() + path
+
+fn Json auth(string token):
+    return token == "" ? {} : { "Authorization": "Bearer " + token }
+
+fn Json get(string path, string token):
+    return await http.get(url(path), auth(token))
+
+fn Json post(string path, Json body, string token):
+    return await http.post(url(path), body, auth(token))
+
+fn Json ops(string token, List<Json> list):
+    return await post("/api/ops", { "run": "t", "ops": list }, token)
+
+# Crea una cuenta directamente en la base y devuelve un token de verdad (por el login).
+fn string account(string name):
+    await sqlite.exec("insert into users (id, username, password_hash, created_at) values (?, ?, ?, ?)",
+        new_id(), name, await hash.argon2("${PW}"), time.now())
+    Json r = await post("/api/login", { "username": name, "password": "${PW}", "name": "pruebas" }, "")
+    test.eq(r["status"], 200, "login de " + name)
+    return r["body"]["token"]
+
+# Un token con otros ámbitos, para probar que se respetan.
+fn string token_with(string name, Json scopes):
+    Json u = await get_user_by_name(name)
+    return await create_token(u["id"], "limitado", scopes)
+
+fn Json cal(string key, string id, string name):
+    return { "op": "cal.put", "key": key, "id": id, "name": name, "color": "#d97757" }
+
+# Un evento de una hora el 12-oct-2026 a las 10:00 UTC (salvo que se diga otra cosa).
+fn Json ev(string key, string id, string calendar, string title):
+    long start = time.parse_iso("2026-10-12T10:00:00Z")
+    return { "op": "event.put", "key": key, "id": id, "calendar_id": calendar, "title": title,
+             "start": start, "end": start + 3600000, "tzid": "Europe/Madrid", "all_day": false }
+
+fn Json result(Json r, int i):
+    return r["body"]["results"][i]
+
+test "sin token no se entra":
+    test.eq((await get("/api/me", ""))["status"], 401)
+    test.eq((await get("/api/me", "no-es-un-token"))["status"], 401)
+    test.eq((await get("/api/changes", ""))["status"], 401)
+    test.eq((await get("/healthz", ""))["body"]["status"], "ok")
+
+test "login: contraseña mala y usuario inexistente dan lo mismo":
+    string t = await account("ana")
+    Json bad = await post("/api/login", { "username": "ana", "password": "mala" }, "")
+    Json ghost = await post("/api/login", { "username": "nadie", "password": "mala" }, "")
+    test.eq(bad["status"], 401)
+    test.eq(ghost["status"], 401)
+    test.eq(bad["body"]["detail"], ghost["body"]["detail"])
+    Json me = await get("/api/me", t)
+    test.eq(me["body"]["username"], "ana")
+
+test "tras 5 fallos la cuenta se bloquea, incluso con la contraseña buena":
+    string t = await account("bea")
+    int i = 0
+    while i < 5:
+        await post("/api/login", { "username": "bea", "password": "mala" }, "")
+        i = i + 1
+    Json locked = await post("/api/login", { "username": "bea", "password": "${PW}" }, "")
+    test.eq(locked["status"], 429)
+    test.ok(int(locked["headers"]["retry-after"]) > 0)
+    # El bloqueo es por cuenta e IP: mientras dure, ni otra cuenta entra desde esa IP.
+    clear_failures("ip:" + "127.0.0.1")
+    clear_failures("user:bea")
+
+test "ops: crear calendario y evento, y verlos en changes":
+    string t = await account("carla")
+    Json r = await ops(t, [cal("1", "cal-carla-01", "Personal"), ev("2", "ev-carla-001", "cal-carla-01", "Dentista")])
+    test.eq(r["status"], 200)
+    test.eq(result(r, 0)["ok"], true)
+    test.eq(result(r, 1)["ok"], true)
+    Json c = await get("/api/changes?since=0", t)
+    test.eq(len(c["body"]["calendars"]), 1)
+    test.eq(len(c["body"]["events"]), 1)
+    test.eq(c["body"]["events"][0]["title"], "Dentista")
+    test.eq(c["body"]["events"][0]["tzid"], "Europe/Madrid")
+    test.eq(c["body"]["more"], false)
+    Json again = await get("/api/changes?since=" + str(c["body"]["rev"]), t)
+    test.eq(len(again["body"]["events"]), 0)
+    test.eq(again["body"]["rev"], c["body"]["rev"])
+
+test "ops es idempotente: repetir el lote no sube revisiones":
+    string t = await account("dani")
+    List<Json> batch = [cal("1", "cal-dani-001", "Trabajo"), ev("2", "ev-dani-0001", "cal-dani-001", "Reunión")]
+    Json first_run = await ops(t, batch)
+    Json second = await ops(t, batch)
+    test.eq(result(second, 0)["unchanged"], true)
+    test.eq(result(second, 1)["unchanged"], true)
+    test.eq(result(second, 1)["rev"], result(first_run, 1)["rev"])
+    test.eq(second["body"]["rev"], first_run["body"]["rev"])
+
+test "conflicto: un cambio basado en una revisión vieja se rechaza y devuelve el estado actual":
+    string t = await account("eva")
+    Json r = await ops(t, [cal("1", "cal-eva-0001", "Casa"), ev("2", "ev-eva-00001", "cal-eva-0001", "Original")])
+    long rev0 = result(r, 1)["rev"]
+    Json edited = ev("3", "ev-eva-00001", "cal-eva-0001", "Editado en el portátil")
+    edited["base_rev"] = rev0
+    Json r2 = await ops(t, [edited])
+    test.eq(result(r2, 0)["ok"], true)
+    # El móvil, que seguía en rev0, intenta cambiarlo también.
+    Json stale = ev("4", "ev-eva-00001", "cal-eva-0001", "Editado en el móvil")
+    stale["base_rev"] = rev0
+    Json r3 = await ops(t, [stale])
+    test.eq(result(r3, 0)["ok"], false)
+    test.eq(result(r3, 0)["conflict"], true)
+    test.eq(result(r3, 0)["current"]["title"], "Editado en el portátil")
+    # Sin base_rev se aplica (el cliente decide pisar).
+    Json force = await ops(t, [ev("5", "ev-eva-00001", "cal-eva-0001", "Pisado")])
+    test.eq(result(force, 0)["ok"], true)
+
+test "aislamiento: nadie ve ni toca lo de otro":
+    string a = await account("fran")
+    string b = await account("gema")
+    await ops(a, [cal("1", "cal-fran-001", "Mío"), ev("2", "ev-fran-0001", "cal-fran-001", "Secreto")])
+    Json seen = await get("/api/changes?since=0", b)
+    test.eq(len(seen["body"]["events"]), 0)
+    test.eq(len(seen["body"]["calendars"]), 0)
+    # Ni escribir en su calendario, ni reusar su id.
+    Json r = await ops(b, [ev("1", "ev-gema-0001", "cal-fran-001", "Intruso"), cal("2", "cal-fran-001", "Robado")])
+    test.eq(result(r, 0)["ok"], false)
+    test.eq(result(r, 1)["ok"], false)
+    Json del = await ops(b, [{ "op": "event.delete", "key": "1", "id": "ev-fran-0001" }])
+    test.eq(result(del, 0)["ok"], true)
+    Json still = await get("/api/changes?since=0", a)
+    test.eq(len(still["body"]["events"]), 1)
+
+test "borrar: aparece como lápida en changes, no desde cero, y borrar un calendario arrastra sus eventos":
+    string t = await account("hugo")
+    Json r = await ops(t, [cal("1", "cal-hugo-001", "A"), ev("2", "ev-hugo-0001", "cal-hugo-001", "Uno"), ev("3", "ev-hugo-0002", "cal-hugo-001", "Dos")])
+    Json c0 = await get("/api/changes?since=0", t)
+    long rev = c0["body"]["rev"]
+    await ops(t, [{ "op": "event.delete", "key": "1", "id": "ev-hugo-0001" }])
+    Json c1 = await get("/api/changes?since=" + str(rev), t)
+    test.eq(len(c1["body"]["events"]), 1)
+    test.eq(c1["body"]["events"][0]["deleted"], true)
+    Json fresh = await get("/api/changes?since=0", t)
+    test.eq(len(fresh["body"]["events"]), 1)
+    await ops(t, [{ "op": "cal.delete", "key": "2", "id": "cal-hugo-001" }])
+    Json after = await get("/api/changes?since=" + str(c1["body"]["rev"]), t)
+    test.eq(len(after["body"]["calendars"]), 1)
+    test.eq(after["body"]["calendars"][0]["deleted"], true)
+    test.eq(len(after["body"]["events"]), 1)
+    Json empty = await get("/api/changes?since=0", t)
+    test.eq(len(empty["body"]["events"]), 0)
+    test.eq(len(empty["body"]["calendars"]), 0)
+
+test "validación":
+    string t = await account("iria")
+    await ops(t, [cal("0", "cal-iria-001", "X")])
+    long s = time.parse_iso("2026-10-12T10:00:00Z")
+    Json backwards = ev("1", "ev-iria-0001", "cal-iria-001", "Al revés")
+    backwards["end"] = s - 1
+    Json badrule = ev("2", "ev-iria-0002", "cal-iria-001", "Regla mala")
+    badrule["rrule"] = "FREQ=SECONDLY"
+    Json badtz = ev("3", "ev-iria-0003", "cal-iria-001", "Zona mala")
+    badtz["tzid"] = "Mars/Olympus"
+    Json nocal = ev("4", "ev-iria-0004", "cal-no-existe", "Sin calendario")
+    Json allday = ev("5", "ev-iria-0005", "cal-iria-001", "Todo el día torcido")
+    allday["all_day"] = true
+    Json badid = ev("6", "x", "cal-iria-001", "Id corto")
+    Json badcolor = cal("7", "cal-iria-002", "Mal color")
+    badcolor["color"] = "rojo"
+    Json unknown = { "op": "event.explode", "key": "8" }
+    Json r = await ops(t, [backwards, badrule, badtz, nocal, allday, badid, badcolor, unknown])
+    int i = 0
+    while i < 8:
+        test.eq(result(r, i)["ok"], false, "operación " + str(i))
+        test.ok(len(str(result(r, i)["error"])) > 3, "mensaje de la operación " + str(i))
+        i = i + 1
+    Json none = await post("/api/ops", { "ops": [] }, t)
+    test.eq(none["status"], 400)
+    Json c = await get("/api/changes?since=0", t)
+    test.eq(len(c["body"]["events"]), 0)
+
+test "un fallo no corta el resto del lote":
+    string t = await account("juan")
+    Json r = await ops(t, [cal("1", "cal-juan-001", "Bien"), ev("2", "ev-juan-0001", "no-existe", "Mal"), ev("3", "ev-juan-0002", "cal-juan-001", "Bien también")])
+    test.eq(result(r, 0)["ok"], true)
+    test.eq(result(r, 1)["ok"], false)
+    test.eq(result(r, 2)["ok"], true)
+
+test "serie: occurrences expande, respeta exdates y excepciones":
+    string t = await account("kira")
+    long start = time.parse_iso("2026-10-05T09:00:00Z")
+    Json series = ev("2", "ev-kira-serie", "cal-kira-001", "Yoga")
+    series["start"] = start
+    series["end"] = start + 3600000
+    series["tzid"] = "UTC"
+    series["rrule"] = "FREQ=WEEKLY;COUNT=4"
+    series["exdates"] = [time.parse_iso("2026-10-12T09:00:00Z"), time.parse_iso("2026-10-19T09:00:00Z")]
+    Json moved = ev("3", "ev-kira-excep", "cal-kira-001", "Yoga (movido)")
+    moved["master_id"] = "ev-kira-serie"
+    moved["start"] = time.parse_iso("2026-10-19T17:00:00Z")
+    moved["end"] = time.parse_iso("2026-10-19T18:00:00Z")
+    moved["tzid"] = "UTC"
+    Json r = await ops(t, [cal("1", "cal-kira-001", "Deporte"), series, moved])
+    test.eq(result(r, 1)["ok"], true, "serie")
+    test.eq(result(r, 2)["ok"], true, "excepción")
+    Json o = await get("/api/occurrences?after=" + str(time.parse_iso("2026-10-01T00:00:00Z")) + "&before=" + str(time.parse_iso("2026-12-01T00:00:00Z")), t)
+    test.eq(o["status"], 200)
+    List<string> got = []
+    for Json x in o["body"]["occurrences"]:
+        got.add(time.format_iso(x["start"]) + " " + x["title"])
+    got.sort()
+    test.eq(got, ["2026-10-05T09:00:00Z Yoga", "2026-10-19T17:00:00Z Yoga (movido)", "2026-10-26T09:00:00Z Yoga"])
+    # Una repetición ya empezada que sigue en curso cuenta en la ventana.
+    Json mid = await get("/api/occurrences?after=" + str(start + 1800000) + "&before=" + str(start + 2400000), t)
+    test.eq(len(mid["body"]["occurrences"]), 1)
+    # Una excepción no puede ser a su vez una serie, ni colgar de algo que no es serie.
+    Json nested = ev("4", "ev-kira-malo1", "cal-kira-001", "Mal")
+    nested["master_id"] = "ev-kira-serie"
+    nested["rrule"] = "FREQ=DAILY"
+    Json orphan = ev("5", "ev-kira-malo2", "cal-kira-001", "Huérfano")
+    orphan["master_id"] = "ev-kira-excep"
+    Json bad = await ops(t, [nested, orphan])
+    test.eq(result(bad, 0)["ok"], false)
+    test.eq(result(bad, 1)["ok"], false)
+    # Borrar la serie borra sus excepciones.
+    await ops(t, [{ "op": "event.delete", "key": "1", "id": "ev-kira-serie" }])
+    Json empty = await get("/api/occurrences?after=" + str(time.parse_iso("2026-10-01T00:00:00Z")) + "&before=" + str(time.parse_iso("2026-12-01T00:00:00Z")), t)
+    test.eq(len(empty["body"]["occurrences"]), 0)
+
+test "eventos de todo el día":
+    string t = await account("luis")
+    long day = time.parse_iso("2026-10-12T00:00:00Z")
+    Json ok = ev("2", "ev-luis-0001", "cal-luis-001", "Festivo")
+    ok["all_day"] = true
+    ok["start"] = day
+    ok["end"] = day + 86400000
+    ok["tzid"] = "Europe/Madrid"
+    Json r = await ops(t, [cal("1", "cal-luis-001", "Fiestas"), ok])
+    test.eq(result(r, 1)["ok"], true)
+    Json c = await get("/api/changes?since=0", t)
+    # Se guarda en UTC aunque el cliente mandara otra zona: es el mismo día en todas.
+    test.eq(c["body"]["events"][0]["tzid"], "UTC")
+
+test "changes pagina por revisión sin perder ni repetir nada":
+    string t = await account("marta")
+    List<Json> batch = [cal("0", "cal-marta-01", "P")]
+    int i = 0
+    while i < 7:
+        batch.add(ev(str(i), "ev-marta-000" + str(i), "cal-marta-01", "E" + str(i)))
+        i = i + 1
+    await ops(t, batch)
+    Json u = await get_user_by_name("marta")
+    long since = 0
+    int seen = 0
+    int pages = 0
+    bool more = true
+    while more:
+        Json page = await changes_since(await get_user_by_name("marta"), since, 3)
+        seen = seen + len(page["events"]) + len(page["calendars"])
+        since = page["rev"]
+        more = page["more"]
+        pages = pages + 1
+        test.ok(pages < 10, "no termina")
+    test.eq(seen, 8)
+    test.eq(pages, 3)
+
+test "un cliente muy atrasado recibe reset tras la purga de lápidas":
+    string t = await account("nuria")
+    await ops(t, [cal("1", "cal-nuria-01", "A"), ev("2", "ev-nuria-001", "cal-nuria-01", "X")])
+    Json c0 = await get("/api/changes?since=0", t)
+    long old = c0["body"]["rev"]
+    await ops(t, [{ "op": "event.delete", "key": "1", "id": "ev-nuria-001" }])
+    # Se envejece la lápida 31 días y corre la limpieza.
+    await sqlite.exec("update events set deleted_at = ? where id = 'ev-nuria-001'", time.now() - 31 * 86400000)
+    await maintenance_run()
+    Json stale = await get("/api/changes?since=" + str(old), t)
+    test.eq(stale["body"]["reset"], true)
+    Json fresh = await get("/api/changes?since=0", t)
+    test.eq(fresh["body"]["reset"], false)
+    test.eq(len(fresh["body"]["calendars"]), 1)
+
+test "ámbitos: un token de solo lectura no escribe":
+    string t = await account("oscar")
+    string ro = await token_with("oscar", ["read"])
+    test.eq((await get("/api/me", ro))["status"], 200)
+    Json r = await ops(ro, [cal("1", "cal-oscar-01", "X")])
+    test.eq(r["status"], 403)
+    string nothing = await token_with("oscar", [])
+    test.eq((await get("/api/me", nothing))["status"], 403)
+
+test "logout revoca el token":
+    string t = await account("paula")
+    test.eq((await get("/api/me", t))["status"], 200)
+    test.eq((await post("/api/logout", {}, t))["status"], 200)
+    test.eq((await get("/api/me", t))["status"], 401)
+
+test "cuenta desactivada no entra con su token":
+    string t = await account("quique")
+    await sqlite.exec("update users set is_active = 0 where username = 'quique'")
+    test.eq((await get("/api/me", t))["status"], 401)
+    Json login = await post("/api/login", { "username": "quique", "password": "${PW}" }, "")
+    test.eq(login["status"], 401)
