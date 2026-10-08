@@ -5,6 +5,14 @@
 
 import test
 
+# Contraseña de las cuentas de prueba: se genera en cada ejecución (no hay ninguna escrita en el repositorio).
+fn string pw():
+    string v = state.get("test_pw", "")
+    if v == "":
+        v = "Aa1-" + hash.random_hex(12)
+        state.set("test_pw", v)
+    return v
+
 fn string server():
     return os.getenv("CALENDAR_TEST_SERVER", "http://127.0.0.1:8198")
 
@@ -24,10 +32,10 @@ fn Json api_post(string path, Json body):
 fn bool login_as(string name):
     # Se crea la cuenta con la CLI del servidor (la misma que usa el administrador).
     Json r = await os.run(os.getenv("CALENDAR_TEST_LUX", "lux"),
-        ["run", os.getenv("CALENDAR_TEST_SERVER_APP", "server/app"), "--", "createuser", name, "--password", "${PW}"],
+        ["run", os.getenv("CALENDAR_TEST_SERVER_APP", "server/app"), "--", "createuser", name, "--password", pw()],
         { "timeout_ms": 30000 })
     test.eq(r["status"], 0, "createuser " + name + ": " + str(r["stderr"]))
-    Json s = await api_post("/api/settings", { "server_url": server(), "username": name, "password": "${PW}" })
+    Json s = await api_post("/api/settings", { "server_url": server(), "username": name, "password": pw() })
     test.eq(s["status"], 200, "login: " + str(s["body"]))
     return true
 
@@ -38,7 +46,7 @@ fn Json srv_get(string path):
 
 # Otro "dispositivo": una sesión propia contra el mismo servidor.
 fn Json other_device(string name):
-    Json r = await http.post(server() + "/api/login", { "username": name, "password": "${PW}", "name": "otro" })
+    Json r = await http.post(server() + "/api/login", { "username": name, "password": pw(), "name": "otro" })
     return { "Authorization": "Bearer " + str(r["body"]["token"]) }
 
 fn Json srv_ops(Json headers, List<Json> ops):

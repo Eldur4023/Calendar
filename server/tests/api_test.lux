@@ -8,6 +8,14 @@
 import http
 import test
 
+# Contraseña de las cuentas de prueba: se genera en cada ejecución (no hay ninguna escrita en el repositorio).
+fn string pw():
+    string v = state.get("test_pw", "")
+    if v == "":
+        v = "Aa1-" + hash.random_hex(12)
+        state.set("test_pw", v)
+    return v
+
 fn string url(string path):
     return test.base_url() + path
 
@@ -26,8 +34,8 @@ fn Json ops(string token, List<Json> list):
 # Crea una cuenta directamente en la base y devuelve un token de verdad (por el login).
 fn string account(string name):
     await sqlite.exec("insert into users (id, username, password_hash, created_at) values (?, ?, ?, ?)",
-        new_id(), name, await hash.argon2("${PW}"), time.now())
-    Json r = await post("/api/login", { "username": name, "password": "${PW}", "name": "pruebas" }, "")
+        new_id(), name, await hash.argon2(pw()), time.now())
+    Json r = await post("/api/login", { "username": name, "password": pw(), "name": "pruebas" }, "")
     test.eq(r["status"], 200, "login de " + name)
     return r["body"]["token"]
 
@@ -70,7 +78,7 @@ test "tras 5 fallos la cuenta se bloquea, incluso con la contraseña buena":
     while i < 5:
         await post("/api/login", { "username": "bea", "password": "mala" }, "")
         i = i + 1
-    Json locked = await post("/api/login", { "username": "bea", "password": "${PW}" }, "")
+    Json locked = await post("/api/login", { "username": "bea", "password": pw() }, "")
     test.eq(locked["status"], 429)
     test.ok(int(locked["headers"]["retry-after"]) > 0)
     # El bloqueo es por cuenta e IP: mientras dure, ni otra cuenta entra desde esa IP.
@@ -305,5 +313,5 @@ test "cuenta desactivada no entra con su token":
     string t = await account("quique")
     await sqlite.exec("update users set is_active = 0 where username = 'quique'")
     test.eq((await get("/api/me", t))["status"], 401)
-    Json login = await post("/api/login", { "username": "quique", "password": "${PW}" }, "")
+    Json login = await post("/api/login", { "username": "quique", "password": pw() }, "")
     test.eq(login["status"], 401)

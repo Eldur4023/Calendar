@@ -14,14 +14,16 @@ PID=""
 cleanup() { [ -n "$PID" ] && kill "$PID" 2>/dev/null; wait 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# Contraseña de la cuenta de prueba: aleatoria en cada ejecución.
+PW="Aa1-$(openssl rand -hex 8)"
 export CALENDAR_DB="$TMP/calendar.db" CALENDAR_PROXY=0 CALENDAR_URL="http://127.0.0.1:$PORT"
-"$LUX" run "$ROOT/app" -- createuser sonda --password '${PW}' >/dev/null 2>&1
+"$LUX" run "$ROOT/app" -- createuser sonda --password "$PW" >/dev/null 2>&1
 "$LUX" "$ROOT/app" --no-watch --port "$PORT" >"$TMP/server.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 50); do curl -fs "$CALENDAR_URL/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
 curl -fs "$CALENDAR_URL/healthz" >/dev/null || { echo "el servidor no arranca"; cat "$TMP/server.log"; exit 1; }
 export CALENDAR_TEST_TOKEN="$(curl -s -X POST "$CALENDAR_URL/api/login" -H 'Content-Type: application/json' \
-  -d '{"username":"sonda","password":"${PW}"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')"
+  -d "{\"username\":\"sonda\",\"password\":\"$PW\"}" | sed -E 's/.*"token":"([^"]+)".*/\1/')"
 
 status=0
 echo "== con el servidor activo"
