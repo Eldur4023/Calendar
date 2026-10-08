@@ -251,3 +251,23 @@ test "cerrar sesión revoca el token y borra la copia local":
     test.eq((await http.get(server() + "/api/me", { "Authorization": "Bearer " + t }))["status"], 401)
     test.eq((await api_get("/api/status"))["body"]["configured"], false)
     test.eq(len((await api_get("/api/data?after=0&before=86400000"))["body"]["calendars"]), 0)
+
+test "un lote que no cabe en una petición se parte en varios":
+    await login_as("kiko")
+    await api_post("/api/ops", { "ops": [cal("cal-kiko-0001", "Grande")] })
+    string notes = "x".repeat(15000)
+    int i = 0
+    while i < 6:
+        List<Json> batch = []
+        int j = 0
+        while j < 20:
+            Json e = ev("ev-kiko-" + str(i) + "-" + str(j) + "-aa", "cal-kiko-0001", "E" + str(i) + str(j), "2026-11-02T09:00:00Z")
+            e["notes"] = notes
+            batch.add(e)
+            j = j + 1
+        test.eq((await api_post("/api/ops", { "ops": batch }))["status"], 200)
+        i = i + 1
+    # 120 cambios de 15 KB: 1,8 MB, más de lo que admite una sola petición al servidor (1 MB).
+    test.eq((await sync_now())["ok"], true)
+    test.eq((await api_get("/api/status"))["body"]["pending"], 0)
+    test.eq(len((await srv_get("/api/changes?since=0"))["body"]["events"]), 120)

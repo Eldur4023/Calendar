@@ -76,11 +76,19 @@ fn Json push():
         List<Json> rows = await sqlite.query("select * from pending order by seq limit 200")
         if len(rows) == 0:
             break
+        # Un lote no puede pasar de ~600 KB (el servidor admite 1 MB por petición): con notas
+        # muy largas se parte en varios. Un solo cambio que ya de por sí no cabe nunca saldrá.
         List<Json> ops = []
+        List<Json> used = []
+        int bytes = 0
         for Json r in rows:
+            if len(ops) > 0 and bytes + len(r["op"]) > 600000:
+                break
             Json op = json.parse(r["op"])
             op["key"] = str(r["seq"])
             ops.add(op)
+            used.add(r)
+            bytes = bytes + len(r["op"])
         Json resp = await remote("POST", "/api/ops", { "run": new_id(), "ops": ops })
         if resp["status"] == 401:
             await put_setting("token", "")
@@ -92,7 +100,7 @@ fn Json push():
         if resp["status"] != 200:
             # Una petición que el servidor no acepta no mejora reintentándola.
             string detail = resp["body"] != null and resp["body"]["detail"] != null ? str(resp["body"]["detail"]) : str(resp["status"])
-            for Json r in rows:
+            for Json r in used:
                 await sqlite.exec("delete from pending where seq = ?", r["seq"])
             await note("error", "El servidor rechazó un lote de cambios: " + detail)
             resync = true

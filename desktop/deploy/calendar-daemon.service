@@ -1,0 +1,40 @@
+[Unit]
+Description=Calendar — réplica local, sincronización y avisos
+# Sin esperar a que nadie inicie sesión: al arrancar el equipo ya sincroniza, y los avisos
+# salen en cuanto hay sesión gráfica.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Corre como el usuario dueño del calendario (install.sh lo rellena): así las notificaciones
+# van a su sesión y la base de datos es suya.
+User=@USER@
+WorkingDirectory=/opt/calendar-desktop
+Environment=CALENDAR_DAEMON_HOME=/var/lib/calendar-daemon
+Environment=CALENDAR_DAEMON_DB=/var/lib/calendar-daemon/state.db
+Environment=CALENDAR_DAEMON_PORT=7879
+# Para llevar las notificaciones al bus de sesión de ese usuario: /run/user/UID/bus.
+Environment=CALENDAR_UID=@UID@
+Environment=CALENDAR_TZ=@TZ@
+ExecStart=/opt/calendar-desktop/lux --no-watch /opt/calendar-desktop/daemon
+Restart=on-failure
+RestartSec=5
+# La base guarda el token del servidor y el secreto de la API local: sólo el usuario.
+UMask=0077
+StateDirectory=calendar-daemon
+StateDirectoryMode=0700
+
+# --- Endurecimiento -------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/calendar-daemon
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

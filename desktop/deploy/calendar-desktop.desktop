@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Calendar
+Comment=Tu calendario: eventos, series y avisos
+Exec=calendar-desktop
+Icon=calendar-desktop
+Terminal=false
+Categories=Office;Calendar;
+Keywords=calendar;calendario;agenda;eventos;
