@@ -1,0 +1,253 @@
+# Extremo a extremo del servicio de escritorio contra un servidor de Calendar real
+# (lo arranca e2e.sh). Cada prueba usa su propia cuenta en el servidor.
+#
+#   desktop/tests/e2e.sh
+
+import test
+
+fn string server():
+    return os.getenv("CALENDAR_TEST_SERVER", "http://127.0.0.1:8198")
+
+fn string url(string path):
+    return test.base_url() + path
+
+fn Json local_headers():
+    return { "X-Calendar-Token": await setting("api_token", "") }
+
+fn Json api_get(string path):
+    return await http.get(url(path), await local_headers())
+
+fn Json api_post(string path, Json body):
+    return await http.post(url(path), body, await local_headers())
+
+# Cuenta nueva en el servidor y sesión del servicio con ella.
+fn bool login_as(string name):
+    # Se crea la cuenta con la CLI del servidor (la misma que usa el administrador).
+    Json r = await os.run(os.getenv("CALENDAR_TEST_LUX", "lux"),
+        ["run", os.getenv("CALENDAR_TEST_SERVER_APP", "server/app"), "--", "createuser", name, "--password", "${PW}"],
+        { "timeout_ms": 30000 })
+    test.eq(r["status"], 0, "createuser " + name + ": " + str(r["stderr"]))
+    Json s = await api_post("/api/settings", { "server_url": server(), "username": name, "password": "${PW}" })
+    test.eq(s["status"], 200, "login: " + str(s["body"]))
+    return true
+
+# Token del servicio frente al servidor, para ver lo que hay allí.
+fn Json srv_get(string path):
+    string t = await setting("token", "")
+    return await http.get(server() + path, { "Authorization": "Bearer " + t })
+
+# Otro "dispositivo": una sesión propia contra el mismo servidor.
+fn Json other_device(string name):
+    Json r = await http.post(server() + "/api/login", { "username": name, "password": "${PW}", "name": "otro" })
+    return { "Authorization": "Bearer " + str(r["body"]["token"]) }
+
+fn Json srv_ops(Json headers, List<Json> ops):
+    return await http.post(server() + "/api/ops", { "ops": ops }, headers)
+
+fn Json cal(string id, string name):
+    return { "op": "cal.put", "id": id, "name": name, "color": "#d97757" }
+
+fn Json ev(string id, string calendar, string title, string start):
+    long s = time.parse_iso(start)
+    return { "op": "event.put", "id": id, "calendar_id": calendar, "title": title, "start": s, "end": s + 3600000, "tzid": "Europe/Madrid", "all_day": false, "reminders": [] }
+
+# Una pasada de sincronización.
+fn Json sync_now():
+    return (await api_post("/api/sync", {}))["body"]
+
+fn Json data(string after, string before):
+    return (await api_get("/api/data?after=" + str(time.parse_iso(after)) + "&before=" + str(time.parse_iso(before))))["body"]
+
+test "sin configurar y con contraseña mala":
+    test.eq((await api_get("/api/status"))["body"]["configured"], false)
+    test.eq((await http.get(url("/api/status")))["status"], 401)
+    Json bad = await api_post("/api/settings", { "server_url": server(), "username": "nadie", "password": "mala" })
+    test.eq(bad["status"], 400)
+    test.eq((await api_get("/api/status"))["body"]["configured"], false)
+
+test "crear sin red y que llegue al servidor":
+    await login_as("ana")
+    await sync_now()
+    Json r = await api_post("/api/ops", { "ops": [cal("cal-ana-0001", "Personal"), ev("ev-ana-00001", "cal-ana-0001", "Dentista", "2026-10-12T10:00:00Z")] })
+    test.eq(r["status"], 200)
+    test.eq(r["body"]["results"][0]["ok"], true)
+    test.eq(r["body"]["results"][1]["ok"], true)
+    # Antes de sincronizar se ve en local y está pendiente.
+    Json d = await data("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z")
+    test.eq(len(d["calendars"]), 1)
+    test.eq(len(d["occurrences"]), 1)
+    test.ok(d["status"]["pending"] > 0, "debería haber cola")
+    test.eq((await sync_now())["ok"], true)
+    test.eq((await api_get("/api/status"))["body"]["pending"], 0)
+    Json srv = await srv_get("/api/changes?since=0")
+    test.eq(srv["body"]["events"][0]["title"], "Dentista")
+    test.eq(len(srv["body"]["calendars"]), 1)
+
+test "lo que cambia otro dispositivo llega, y los borrados también":
+    await login_as("beto")
+    await api_post("/api/ops", { "ops": [cal("cal-beto-001", "Trabajo"), ev("ev-beto-0001", "cal-beto-001", "Reunión", "2026-10-13T09:00:00Z")] })
+    await sync_now()
+    Json other = await other_device("beto")
+    await srv_ops(other, [ev("ev-beto-0002", "cal-beto-001", "Desde el móvil", "2026-10-14T09:00:00Z"), { "op": "event.delete", "id": "ev-beto-0001" }])
+    test.eq((await sync_now())["ok"], true)
+    Json d = await data("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z")
+    test.eq(len(d["occurrences"]), 1)
+    test.eq(d["occurrences"][0]["title"], "Desde el móvil")
+
+test "sin conexión no se pierde nada y se envía al volver":
+    await login_as("carla")
+    await api_post("/api/ops", { "ops": [cal("cal-carla-01", "A")] })
+    await sync_now()
+    string real = await server_url()
+    await put_setting("server_url", "http://127.0.0.1:9")
+    await api_post("/api/ops", { "ops": [ev("ev-carla-001", "cal-carla-01", "Hecho sin red", "2026-10-15T09:00:00Z")] })
+    Json fail = await sync_now()
+    test.eq(fail["ok"], false)
+    test.eq((await api_get("/api/status"))["body"]["online"], false)
+    test.eq((await api_get("/api/status"))["body"]["pending"], 1)
+    test.eq(len((await data("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"))["occurrences"]), 1)
+    await put_setting("server_url", real)
+    test.eq((await sync_now())["ok"], true)
+    test.eq((await api_get("/api/status"))["body"]["pending"], 0)
+    test.eq(len((await srv_get("/api/changes?since=0"))["body"]["events"]), 1)
+
+test "conflicto: gana la edición más reciente":
+    await login_as("dani")
+    await api_post("/api/ops", { "ops": [cal("cal-dani-001", "A"), ev("ev-dani-0001", "cal-dani-001", "Original", "2026-10-16T09:00:00Z"), ev("ev-dani-0002", "cal-dani-001", "Otro original", "2026-10-17T09:00:00Z")] })
+    await sync_now()
+    Json other = await other_device("dani")
+    string real = await server_url()
+    await put_setting("server_url", "http://127.0.0.1:9")
+    # 1) Aquí se edita sin red PRIMERO y el otro dispositivo DESPUÉS: gana el otro.
+    await api_post("/api/ops", { "ops": [ev("ev-dani-0001", "cal-dani-001", "Editado aquí (antes)", "2026-10-16T09:00:00Z")] })
+    await sleep(30)
+    await srv_ops(other, [ev("ev-dani-0001", "cal-dani-001", "Editado en el móvil (después)", "2026-10-16T09:00:00Z")])
+    # 2) El otro edita PRIMERO y aquí se edita después: gana lo de aquí.
+    await srv_ops(other, [ev("ev-dani-0002", "cal-dani-001", "Móvil (antes)", "2026-10-17T09:00:00Z")])
+    await sleep(30)
+    await api_post("/api/ops", { "ops": [ev("ev-dani-0002", "cal-dani-001", "Editado aquí (después)", "2026-10-17T09:00:00Z")] })
+    await put_setting("server_url", real)
+    test.eq((await sync_now())["ok"], true)
+    test.eq((await api_get("/api/status"))["body"]["pending"], 0)
+    Json s = await srv_get("/api/changes?since=0")
+    Json titles = {}
+    for Json e in s["body"]["events"]:
+        titles[e["id"]] = e["title"]
+    test.eq(titles["ev-dani-0001"], "Editado en el móvil (después)")
+    test.eq(titles["ev-dani-0002"], "Editado aquí (después)")
+    Json local = await data("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z")
+    Json ltitles = {}
+    for Json o in local["occurrences"]:
+        ltitles[o["id"]] = o["title"]
+    test.eq(ltitles["ev-dani-0001"], "Editado en el móvil (después)")
+    test.eq(ltitles["ev-dani-0002"], "Editado aquí (después)")
+    Json log = (await api_get("/api/log"))["body"]["log"]
+    int conflicts = 0
+    for Json l in log:
+        if str(l["message"]).contains("Conflicto"):
+            conflicts = conflicts + 1
+    test.eq(conflicts, 2)
+
+test "un cambio que el servidor rechaza no deja la réplica distinta":
+    await login_as("eli")
+    await api_post("/api/ops", { "ops": [cal("cal-eli-0001", "A"), ev("ev-eli-00001", "cal-eli-0001", "Bien", "2026-10-18T09:00:00Z")] })
+    await sync_now()
+    # El calendario desaparece en el servidor; el cambio local sobre su evento se rechaza.
+    Json other = await other_device("eli")
+    string real = await server_url()
+    await put_setting("server_url", "http://127.0.0.1:9")
+    await api_post("/api/ops", { "ops": [ev("ev-eli-00001", "cal-eli-0001", "Editado", "2026-10-18T09:00:00Z")] })
+    await srv_ops(other, [{ "op": "cal.delete", "id": "cal-eli-0001" }])
+    await put_setting("server_url", real)
+    test.eq((await sync_now())["ok"], true)
+    test.eq(len((await data("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"))["occurrences"]), 0)
+    test.eq(len((await data("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"))["calendars"]), 0)
+
+test "series: se expanden en local con excepciones":
+    await login_as("fer")
+    long start = time.parse_iso("2026-10-05T09:00:00Z")
+    Json series = ev("ev-fer-serie1", "cal-fer-0001", "Yoga", "2026-10-05T09:00:00Z")
+    series["rrule"] = "FREQ=WEEKLY;COUNT=4"
+    series["tzid"] = "UTC"
+    series["exdates"] = [time.parse_iso("2026-10-12T09:00:00Z")]
+    Json moved = ev("ev-fer-excep1", "cal-fer-0001", "Yoga (movido)", "2026-10-12T17:00:00Z")
+    moved["master_id"] = "ev-fer-serie1"
+    moved["tzid"] = "UTC"
+    Json r = await api_post("/api/ops", { "ops": [cal("cal-fer-0001", "Deporte"), series, moved] })
+    test.eq(r["body"]["results"][1]["ok"], true)
+    test.eq(r["body"]["results"][2]["ok"], true)
+    await sync_now()
+    Json d = await data("2026-10-01T00:00:00Z", "2026-12-01T00:00:00Z")
+    List<string> got = []
+    for Json o in d["occurrences"]:
+        got.add(time.format_iso(o["start"]) + " " + o["title"])
+    got.sort()
+    test.eq(got, ["2026-10-05T09:00:00Z Yoga", "2026-10-12T17:00:00Z Yoga (movido)", "2026-10-19T09:00:00Z Yoga", "2026-10-26T09:00:00Z Yoga"])
+    Json one = await api_get("/api/events/ev-fer-serie1")
+    test.eq(one["body"]["rrule"], "FREQ=WEEKLY;COUNT=4")
+    test.eq(one["body"]["start"], start)
+
+test "validación local inmediata":
+    await login_as("gus")
+    long s = time.parse_iso("2026-10-20T09:00:00Z")
+    Json bad = ev("ev-gus-00001", "cal-gus-0001", "Al revés", "2026-10-20T09:00:00Z")
+    bad["end"] = s - 1
+    Json rule = ev("ev-gus-00002", "cal-gus-0001", "Regla", "2026-10-20T09:00:00Z")
+    rule["rrule"] = "FREQ=SECONDLY"
+    Json nocal = ev("ev-gus-00003", "no-existe-aun", "Sin calendario", "2026-10-20T09:00:00Z")
+    Json r = await api_post("/api/ops", { "ops": [cal("cal-gus-0001", "Ok"), bad, rule, nocal] })
+    test.eq(r["body"]["results"][0]["ok"], true)
+    test.eq(r["body"]["results"][1]["ok"], false)
+    test.eq(r["body"]["results"][2]["ok"], false)
+    test.eq(r["body"]["results"][3]["ok"], false)
+    test.eq(len((await data("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"))["occurrences"]), 0)
+
+test "crear y borrar antes de sincronizar no llega al servidor":
+    await login_as("hugo")
+    await api_post("/api/ops", { "ops": [cal("cal-hugo-001", "A"), ev("ev-hugo-0001", "cal-hugo-001", "Efímero", "2026-10-21T09:00:00Z")] })
+    await api_post("/api/ops", { "ops": [{ "op": "event.delete", "id": "ev-hugo-0001" }] })
+    test.eq((await sync_now())["ok"], true)
+    Json s = await srv_get("/api/changes?since=0")
+    test.eq(len(s["body"]["events"]), 0)
+    test.eq(len(s["body"]["calendars"]), 1)
+
+test "avisos: se lanzan una vez, con el servicio de notificaciones y sin él":
+    await login_as("iris")
+    long now = time.now()
+    string soon = time.format_iso(now + 5 * 60000)
+    Json e1 = ev("ev-iris-00001", "cal-iris-001", "Cita en 5 min", soon)
+    e1["reminders"] = [10, 0]
+    Json far = ev("ev-iris-00002", "cal-iris-001", "Dentro de un día", time.format_iso(now + 86400000))
+    far["reminders"] = [10]
+    Json past = ev("ev-iris-00003", "cal-iris-001", "Ya pasó", time.format_iso(now - 3600000))
+    past["reminders"] = [10]
+    await api_post("/api/ops", { "ops": [cal("cal-iris-001", "Avisos"), e1, far, past] })
+    # Sin sesión gráfica el envío falla: el aviso queda anotado pero no entregado, y se reintentará.
+    await check_reminders()
+    Json alerts = (await api_get("/api/alerts"))["body"]["alerts"]
+    test.eq(len(alerts), 1)
+    test.eq(alerts[0]["title"], "Cita en 5 min")
+    test.eq(alerts[0]["minutes"], 10)
+    test.eq((await sqlite.query("select notified from fired where event_id = 'ev-iris-00001'"))[0]["notified"], 0)
+    # Con un notify-send que funciona se entrega y no se repite.
+    await check_reminders()
+    test.eq(len((await api_get("/api/alerts"))["body"]["alerts"]), 1)
+    await os.write_file(os.getenv("CALENDAR_TEST_NOTIFY_OK", "/dev/null"), "1")
+    await check_reminders()
+    int delivered = (await sqlite.query("select count(*) as n from fired where event_id = 'ev-iris-00001' and notified = 1"))[0]["n"]
+    test.eq(delivered, 1)
+    string captured = await os.read_file(os.getenv("CALENDAR_TEST_NOTIFY_LOG", "/dev/null"))
+    test.contains(captured, "Cita en 5 min")
+    await check_reminders()
+    string again = await os.read_file(os.getenv("CALENDAR_TEST_NOTIFY_LOG", "/dev/null"))
+    test.eq(again, captured, "no se repite")
+
+test "cerrar sesión revoca el token y borra la copia local":
+    await login_as("juan")
+    await api_post("/api/ops", { "ops": [cal("cal-juan-001", "A")] })
+    await sync_now()
+    string t = await setting("token", "")
+    test.eq((await api_post("/api/logout", {}))["status"], 200)
+    test.eq((await http.get(server() + "/api/me", { "Authorization": "Bearer " + t }))["status"], 401)
+    test.eq((await api_get("/api/status"))["body"]["configured"], false)
+    test.eq(len((await api_get("/api/data?after=0&before=86400000"))["body"]["calendars"]), 0)

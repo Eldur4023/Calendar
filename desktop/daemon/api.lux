@@ -1,0 +1,136 @@
+# API local, sólo en 127.0.0.1. La usa la ventana de escritorio; todas las rutas
+# exigen el secreto del fichero `api-token` en la cabecera X-Calendar-Token.
+
+fn bool need_token():
+    string want = await setting("api_token", "")
+    string given = header("X-Calendar-Token", "")
+    if want == "" or not hash.equal(given, want):
+        abort(401, "falta el secreto de la API local")
+    return true
+
+fn Json status_view():
+    return {
+        "configured": await configured(),
+        "server_url": await server_url(),
+        "user": await setting("user", ""),
+        "online": await setting("online", "") == "1",
+        "last_sync": int(await setting("last_sync", "0")),
+        "last_error": await setting("last_error", ""),
+        "pending": await pending_count(),
+        "timezone": local_tz()
+    }
+
+get endpoint("/api/status"):
+    await need_token()
+    return await status_view()
+
+# Inicia sesión en el servidor (con usuario y contraseña, una vez) y guarda el token.
+# La contraseña no se guarda. Si entra otra cuenta distinta, se tira la copia local.
+post endpoint("/api/settings", Json body):
+    await need_token()
+    string url = str(body["server_url"]).trim()
+    while url.ends_with("/"):
+        url = url.slice(0, len(url) - 1)
+    string username = str(body["username"]).trim().lower()
+    string password = str(body["password"])
+    if not (url.starts_with("http://") or url.starts_with("https://")) or username == "" or password == "":
+        return { "ok": false, "error": "indica la dirección del servidor (https://…), el usuario y la contraseña" }.status(400)
+    string device = "Calendar de escritorio"
+    try:
+        Json h = await os.run("hostname", [], { "timeout_ms": 2000 })
+        if h["status"] == 0 and str(h["stdout"]).trim() != "":
+            device = "Calendar · " + str(h["stdout"]).trim()
+    catch e:
+        device = "Calendar de escritorio"
+    Json r = await remote_login(url, username, password, body.has("totp") ? str(body["totp"]) : "", device)
+    if not r["ok"]:
+        return { "ok": false, "error": r["error"], "totp_required": r["totp_required"] }.status(400)
+    string previous = await setting("user", "")
+    if previous != username or await server_url() != url:
+        await sqlite.begin()
+        await sqlite.exec("delete from events")
+        await sqlite.exec("delete from calendars")
+        await sqlite.exec("delete from pending")
+        await sqlite.exec("delete from fired")
+        await sqlite.exec("delete from alerts")
+        await put_setting("rev", "0")
+        await sqlite.commit()
+    await put_setting("server_url", url)
+    await put_setting("token", str(r["token"]))
+    await put_setting("user", username)
+    await put_setting("online", "1")
+    await put_setting("last_error", "")
+    state.set("backoff_until", 0)
+    state.set("sync_now", 1)
+    await note("info", "sesión iniciada como " + username + " en " + url)
+    return { "ok": true, "user": username }
+
+# Cierra la sesión: avisa al servidor para revocar el token y olvida la copia local.
+post endpoint("/api/logout"):
+    await need_token()
+    if await configured():
+        await remote("POST", "/api/logout", {})
+    await sqlite.begin()
+    await sqlite.exec("delete from events")
+    await sqlite.exec("delete from calendars")
+    await sqlite.exec("delete from pending")
+    await sqlite.exec("delete from fired")
+    await sqlite.exec("delete from alerts")
+    await sqlite.commit()
+    await put_setting("token", "")
+    await put_setting("user", "")
+    await put_setting("rev", "0")
+    await put_setting("online", "")
+    await note("info", "sesión cerrada")
+    return { "ok": true }
+
+# Lo que necesita pintar un periodo: calendarios y apariciones ya expandidas.
+get endpoint("/api/data", long after, long before):
+    await need_token()
+    if before <= after or before - after > 400 * 86400000:
+        return { "detail": "El intervalo debe ser positivo y de como mucho 400 días." }.status(400)
+    return {
+        "status": await status_view(),
+        "calendars": await calendars_list(),
+        "occurrences": await visible_occurrences(after, before)
+    }
+
+get endpoint("/api/events/:id", string id):
+    await need_token()
+    Json r = first(await sqlite.query("select * from events where id = ?", id))
+    if r == null:
+        return { "detail": "No existe ese evento." }.status(404)
+    return event_view(r)
+
+# Cambios del usuario sobre la réplica: se aplican al instante y se envían en cuanto hay red.
+post endpoint("/api/ops", Json body):
+    await need_token()
+    if not body.has("ops") or len(body["ops"]) == 0:
+        return { "detail": "Falta la lista de operaciones." }.status(400)
+    if len(body["ops"]) > 200:
+        return { "detail": "Como mucho 200 operaciones por lote." }.status(413)
+    return { "results": await local_apply(body["ops"]) }
+
+post endpoint("/api/sync"):
+    await need_token()
+    state.set("backoff_until", 0)
+    return await sync_once()
+
+get endpoint("/api/log"):
+    await need_token()
+    return { "log": await sqlite.query("select ts, level, message from log order by id desc limit 100") }
+
+get endpoint("/api/alerts", long since = 0):
+    await need_token()
+    return { "alerts": await sqlite.query("select * from alerts where at > ? order by id desc limit 50", since) }
+
+get endpoint("/healthz"):
+    return { "status": "ok" }
+
+on error:
+    int code = error.code
+    string detail = error.message
+    if code >= 500:
+        log.error("error " + str(code) + " en " + request.method + " " + request.path + ": " + error.message)
+        detail = "Error interno."
+    return { "detail": detail }

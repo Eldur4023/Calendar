@@ -1,0 +1,222 @@
+# Sincronización con el servidor: primero se envía la cola de cambios locales y
+# después se trae lo nuevo. Con el servidor inalcanzable no se pierde nada: la cola
+# espera y se reintenta.
+#
+# CONFLICTOS. Si el servidor ve que un cambio parte de una versión vieja (otro
+# cliente lo cambió antes), responde con la versión actual. Se queda la más
+# reciente de las dos, por la hora en que se editó cada una, y se avisa en el
+# registro; la perdedora no se guarda aparte.
+
+fn bool configured():
+    return await server_url() != "" and await setting("token", "") != ""
+
+# Una fila del servidor -> réplica (sin pisar lo que el usuario tenga pendiente de enviar).
+fn bool apply_remote_cal(Json c):
+    if c["deleted"]:
+        for Json e in await sqlite.query("select id from events where calendar_id = ?", c["id"]):
+            await sqlite.exec("delete from pending where target_id = ?", e["id"])
+        await sqlite.exec("delete from events where calendar_id = ?", c["id"])
+        await sqlite.exec("delete from calendars where id = ?", c["id"])
+        await sqlite.exec("delete from pending where target_id = ?", c["id"])
+        return true
+    if await is_pending(c["id"]):
+        return false
+    await sqlite.exec(
+        "insert into calendars (id, name, color, position, rev, updated_at, dirty) values (?, ?, ?, ?, ?, ?, 0) on conflict(id) do update set name = excluded.name, color = excluded.color, position = excluded.position, rev = excluded.rev, updated_at = excluded.updated_at, dirty = 0",
+        c["id"], c["name"], c["color"], c["position"], c["rev"], c["updated_at"])
+    return true
+
+fn bool apply_remote_event(Json e):
+    if e["deleted"]:
+        await sqlite.exec("delete from events where id = ?", e["id"])
+        await sqlite.exec("delete from pending where target_id = ?", e["id"])
+        return true
+    if await is_pending(e["id"]):
+        return false
+    await sqlite.exec(
+        "insert into events (id, calendar_id, master_id, title, location, notes, start_ms, end_ms, all_day, tzid, rrule, exdates, reminders, rev, updated_at, dirty) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) on conflict(id) do update set calendar_id = excluded.calendar_id, master_id = excluded.master_id, title = excluded.title, location = excluded.location, notes = excluded.notes, start_ms = excluded.start_ms, end_ms = excluded.end_ms, all_day = excluded.all_day, tzid = excluded.tzid, rrule = excluded.rrule, exdates = excluded.exdates, reminders = excluded.reminders, rev = excluded.rev, updated_at = excluded.updated_at, dirty = 0",
+        e["id"], e["calendar_id"], e["master_id"], e["title"], e["location"], e["notes"], e["start"], e["end"], e["all_day"] ? 1 : 0,
+        e["tzid"], e["rrule"] == null ? "" : e["rrule"], json.stringify(e["exdates"]), json.stringify(e["reminders"]), e["rev"], e["updated_at"])
+    return true
+
+# ── Enviar ──────────────────────────────────────────────────────────────────
+
+fn bool is_cal_op(Json op):
+    return str(op["op"]).starts_with("cal.")
+
+# Decide un conflicto: se queda la versión más reciente. `pend` es la fila de la cola.
+fn bool resolve_conflict(Json pend, Json op, Json current):
+    string label = current["title"] != null ? str(current["title"]) : str(current["name"])
+    if label == "":
+        label = "(sin título)"
+    if pend["edited_at"] > current["updated_at"]:
+        op["base_rev"] = current["rev"]
+        await sqlite.exec("update pending set op = ? where seq = ?", json.stringify(op), pend["seq"])
+        if is_cal_op(op):
+            await sqlite.exec("update calendars set rev = ? where id = ?", current["rev"], op["id"])
+        else:
+            await sqlite.exec("update events set rev = ? where id = ?", current["rev"], op["id"])
+        await note("warn", "Conflicto en «" + label + "»: se conserva tu versión, que es más reciente.")
+    else:
+        await sqlite.exec("delete from pending where seq = ?", pend["seq"])
+        if is_cal_op(op):
+            await apply_remote_cal(current)
+        else:
+            await apply_remote_event(current)
+        await note("warn", "Conflicto en «" + label + "»: se ha conservado la versión del servidor, que es más reciente.")
+    return true
+
+# Manda la cola. Devuelve {"ok", "error", "resync"}: resync si el servidor rechazó algo
+# y la réplica puede haber quedado distinta de él.
+fn Json push():
+    bool resync = false
+    int rounds = 0
+    while rounds < 20:
+        rounds = rounds + 1
+        List<Json> rows = await sqlite.query("select * from pending order by seq limit 200")
+        if len(rows) == 0:
+            break
+        List<Json> ops = []
+        for Json r in rows:
+            Json op = json.parse(r["op"])
+            op["key"] = str(r["seq"])
+            ops.add(op)
+        Json resp = await remote("POST", "/api/ops", { "run": new_id(), "ops": ops })
+        if resp["status"] == 401:
+            await put_setting("token", "")
+            await note("error", "El servidor ha cerrado la sesión (token revocado o cuenta desactivada). Vuelve a iniciar sesión.")
+            return { "ok": false, "error": "sesión cerrada por el servidor", "resync": false }
+        if resp["status"] == 0 or resp["status"] >= 500:
+            string why = resp["body"] != null and resp["body"]["error"] != null ? str(resp["body"]["error"]) : "el servidor respondió " + str(resp["status"])
+            return { "ok": false, "error": why, "resync": resync }
+        if resp["status"] != 200:
+            # Una petición que el servidor no acepta no mejora reintentándola.
+            string detail = resp["body"] != null and resp["body"]["detail"] != null ? str(resp["body"]["detail"]) : str(resp["status"])
+            for Json r in rows:
+                await sqlite.exec("delete from pending where seq = ?", r["seq"])
+            await note("error", "El servidor rechazó un lote de cambios: " + detail)
+            resync = true
+            continue
+        for Json res in resp["body"]["results"]:
+            int seq = int(res["key"])
+            Json pend = first(await sqlite.query("select * from pending where seq = ?", seq))
+            if pend == null:
+                continue   # se cambió otra vez mientras se enviaba: ya hay otro apunte más reciente
+            Json op = json.parse(pend["op"])
+            if res["ok"]:
+                await sqlite.exec("delete from pending where seq = ?", seq)
+                if str(op["op"]).ends_with(".put"):
+                    if is_cal_op(op):
+                        await sqlite.exec("update calendars set rev = ?, dirty = (select count(*) from pending where target_id = ?) where id = ?", res["rev"], op["id"], op["id"])
+                    else:
+                        await sqlite.exec("update events set rev = ?, dirty = (select count(*) from pending where target_id = ?) where id = ?", res["rev"], op["id"], op["id"])
+            else if res["conflict"] == true:
+                await resolve_conflict(pend, op, res["current"])
+            else:
+                await sqlite.exec("delete from pending where seq = ?", seq)
+                await note("error", "El servidor no aceptó un cambio: " + str(res["error"]))
+                resync = true
+    return { "ok": true, "error": "", "resync": resync }
+
+# ── Traer ───────────────────────────────────────────────────────────────────
+
+# Trae los cambios desde la última revisión. Desde cero (`since` 0) también retira lo
+# que ya no esté en el servidor. Devuelve {"ok", "error"}.
+fn Json pull(bool full):
+    long since = full ? 0 : int(await setting("rev", "0"))
+    Json seen_cals = {}
+    Json seen_events = {}
+    int rounds = 0
+    while rounds < 200:
+        rounds = rounds + 1
+        Json resp = await remote("GET", "/api/changes?since=" + str(since), null)
+        if resp["status"] == 401:
+            await put_setting("token", "")
+            await note("error", "El servidor ha cerrado la sesión. Vuelve a iniciar sesión.")
+            return { "ok": false, "error": "sesión cerrada por el servidor" }
+        if resp["status"] != 200:
+            string why = resp["body"] != null and resp["body"]["error"] != null ? str(resp["body"]["error"]) : "el servidor respondió " + str(resp["status"])
+            return { "ok": false, "error": why }
+        Json b = resp["body"]
+        if b["reset"] == true:
+            # Se purgaron borrados que no vimos: lo local ya no es fiable, a empezar de cero.
+            await note("info", "Hace demasiado que no se sincronizaba: se vuelve a descargar todo.")
+            await put_setting("rev", "0")
+            since = 0
+            full = true
+            seen_cals = {}
+            seen_events = {}
+            continue
+        await sqlite.begin()
+        for Json c in b["calendars"]:
+            seen_cals[c["id"]] = true
+            await apply_remote_cal(c)
+        for Json e in b["events"]:
+            seen_events[e["id"]] = true
+            await apply_remote_event(e)
+        await put_setting("rev", str(b["rev"]))
+        await sqlite.commit()
+        since = b["rev"]
+        if not b["more"]:
+            break
+    if full:
+        # Lo que quedó en la réplica sin cambios pendientes y el servidor no mandó, ya no existe.
+        await sqlite.begin()
+        for Json c in await sqlite.query("select id from calendars where dirty = 0"):
+            if not seen_cals.has(c["id"]) and not await is_pending(c["id"]):
+                await sqlite.exec("delete from calendars where id = ?", c["id"])
+        for Json e in await sqlite.query("select id from events where dirty = 0"):
+            if not seen_events.has(e["id"]) and not await is_pending(e["id"]):
+                await sqlite.exec("delete from events where id = ?", e["id"])
+        await sqlite.commit()
+    return { "ok": true, "error": "" }
+
+# Una pasada completa: enviar y traer. Sólo una a la vez.
+fn Json sync_once():
+    if not await configured():
+        return { "ok": false, "error": "sin configurar" }
+    long locked = state.get("sync_lock", 0)
+    if time.now() - locked < 120000:
+        return { "ok": false, "error": "ya hay una sincronización en curso" }
+    state.set("sync_lock", time.now())
+    Json result = { "ok": false, "error": "" }
+    try:
+        await put_setting("last_attempt", str(time.now()))
+        Json sent = await push()
+        result = sent
+        if sent["ok"]:
+            Json got = await pull(sent["resync"])
+            result = got
+        if result["ok"]:
+            await put_setting("last_sync", str(time.now()))
+            await put_setting("last_error", "")
+            await put_setting("online", "1")
+        else:
+            await put_setting("last_error", str(result["error"]))
+            await put_setting("online", "0")
+    catch e:
+        result = { "ok": false, "error": e.message }
+        await put_setting("last_error", e.message)
+        await put_setting("online", "0")
+        log.error("fallo al sincronizar: " + e.message)
+    state.set("sync_lock", 0)
+    if not result["ok"]:
+        # Sin red no se insiste cada pocos segundos.
+        state.set("backoff_until", time.now() + 30000)
+    return result
+
+# El ritmo lo marca un reloj corto: sincroniza si hay cambios locales por enviar
+# (`sync_now`) o si toca el sondeo (cada minuto), y lanza los avisos que toquen.
+every "5s":
+    try:
+        if await configured():
+            long last = int(await setting("last_attempt", "0"))
+            bool wanted = state.get("sync_now", 0) == 1 or time.now() - last >= 60000
+            if wanted and time.now() >= state.get("backoff_until", 0):
+                state.set("sync_now", 0)
+                await sync_once()
+        if time.now() - state.get("reminders_last", 0) >= 15000:
+            state.set("reminders_last", time.now())
+            await check_reminders()
+    catch e:
+        log.error("fallo en la tarea periódica: " + e.message)

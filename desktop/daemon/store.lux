@@ -1,0 +1,156 @@
+# Estado local del servicio. Las marcas de tiempo son milisegundos UTC.
+#
+#   settings   server_url, token (del servidor), api_token (de esta API local), ...
+#   calendars  réplica de los calendarios; `dirty` = hay un cambio local sin enviar
+#   events     réplica de los eventos (mismas columnas que el servidor)
+#   pending    cola de cambios locales por enviar, en orden
+#   fired      avisos ya lanzados (uno por evento, aparición y antelación)
+#   alerts     los avisos recientes, para que la ventana los muestre
+#   log        sucesos para la ventana (conflictos, errores, sincronizaciones)
+#
+# MIGRACIONES: como en el servidor, una lista de versiones que sólo crece.
+
+fn List<Json> migrations():
+    return [
+        [
+            "create table settings (key text primary key, value text not null)",
+            """
+            create table calendars (
+                id text primary key,
+                name text not null,
+                color text not null,
+                position integer not null default 0,
+                rev integer not null default 0,
+                updated_at integer not null,
+                dirty integer not null default 0
+            )
+            """,
+            """
+            create table events (
+                id text primary key,
+                calendar_id text not null,
+                master_id text,
+                title text not null default '',
+                location text not null default '',
+                notes text not null default '',
+                start_ms integer not null,
+                end_ms integer not null,
+                all_day integer not null default 0,
+                tzid text not null default 'UTC',
+                rrule text not null default '',
+                exdates text not null default '[]',
+                reminders text not null default '[]',
+                rev integer not null default 0,
+                updated_at integer not null,
+                dirty integer not null default 0
+            )
+            """,
+            "create index ix_events_start on events (start_ms)",
+            "create index ix_events_cal on events (calendar_id)",
+            """
+            create table pending (
+                seq integer primary key autoincrement,
+                target_id text not null,
+                op text not null,
+                edited_at integer not null
+            )
+            """,
+            "create index ix_pending_target on pending (target_id)",
+            """
+            create table fired (
+                event_id text not null,
+                instance integer not null,
+                minutes integer not null,
+                at integer not null,
+                notified integer not null default 0,
+                primary key (event_id, instance, minutes)
+            )
+            """,
+            """
+            create table alerts (
+                id integer primary key autoincrement,
+                at integer not null,
+                event_id text not null,
+                title text not null,
+                start_ms integer not null,
+                minutes integer not null
+            )
+            """,
+            """
+            create table log (
+                id integer primary key autoincrement,
+                ts integer not null,
+                level text not null,
+                message text not null
+            )
+            """
+        ]
+    ]
+
+fn Json first(List<Json> rows):
+    return len(rows) == 0 ? null : rows[0]
+
+fn string setting(string key, string fallback):
+    List<Json> rows = await sqlite.query("select value from settings where key = ?", key)
+    if len(rows) == 0:
+        return fallback
+    return str(rows[0]["value"])
+
+fn bool put_setting(string key, string value):
+    await sqlite.exec("insert into settings (key, value) values (?, ?) on conflict(key) do update set value = excluded.value", key, value)
+    return true
+
+fn Json parse_json_text(Json raw, Json fallback):
+    if raw == null or raw == "":
+        return fallback
+    try:
+        return json.parse(raw)
+    catch e:
+        return fallback
+
+# Un suceso para la ventana (y para el diario del servicio).
+fn bool note(string level, string message):
+    if level == "error":
+        log.error(message)
+    else:
+        log.info(message)
+    await sqlite.exec("insert into log (ts, level, message) values (?, ?, ?)", time.now(), level, message)
+    # ponytail: se conservan los últimos 300; si hiciera falta histórico, a un fichero.
+    await sqlite.exec("delete from log where id <= (select max(id) from log) - 300")
+    return true
+
+# Zona horaria en la que se muestran las horas de los avisos.
+fn string local_tz():
+    return os.getenv("CALENDAR_TZ", "Europe/Madrid")
+
+on start:
+    await sqlite.exec("create table if not exists schema_version (version integer not null)")
+    List<Json> v = await sqlite.query("select version from schema_version")
+    int current = 0
+    if len(v) == 0:
+        await sqlite.exec("insert into schema_version (version) values (0)")
+    else:
+        current = v[0]["version"]
+    List<Json> all = migrations()
+    while current < len(all):
+        await sqlite.begin()
+        for string ddl in all[current]:
+            await sqlite.exec(ddl)
+        current = current + 1
+        await sqlite.exec("update schema_version set version = ?", current)
+        await sqlite.commit()
+        log.info("esquema migrado a la versión " + str(current))
+
+    # Secreto de la API local. La ventana lo lee de este fichero, así que sólo la
+    # entiende quien pueda leerlo (el usuario del servicio).
+    string home = os.getenv("CALENDAR_DAEMON_HOME", ".")
+    string token = await setting("api_token", "")
+    if token == "":
+        token = hash.token(32)
+        await put_setting("api_token", token)
+    string token_file = os.path_join(home, "api-token")
+    await os.write_file(token_file, token)
+    os.chmod(token_file, "600")
+    # La base guarda el token del servidor: sólo para el usuario del servicio.
+    os.chmod(os.getenv("CALENDAR_DAEMON_DB", "./state.db"), "600")
+    log.info("Calendar listo; secreto de la API en " + token_file)

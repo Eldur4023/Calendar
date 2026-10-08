@@ -1,0 +1,86 @@
+# Avisos de escritorio, también con la ventana cerrada.
+#
+# Cada pocos segundos se miran los eventos con avisos: para cada aparición cuyo aviso
+# (inicio menos N minutos) ya ha llegado y que aún no ha empezado, se manda una
+# notificación con notify-send al bus de sesión del usuario. Si nadie ha iniciado
+# sesión (o no hay servicio de notificaciones), el envío falla, se anota y se
+# reintenta mientras el evento no haya empezado: al iniciar sesión llegan los que
+# quedaron pendientes. Cada aviso se lanza una sola vez (tabla `fired`).
+
+# Los eventos de todo el día se avisan respecto a la medianoche LOCAL de su fecha,
+# no a la medianoche UTC en que están guardados.
+fn long effective_start(Json r, long start):
+    if r["all_day"] != 1:
+        return start
+    # El mediodía UTC de la fecha cae en esa misma fecha en cualquier zona de Europa y América.
+    return time.start_of(start + 43200000, "day", local_tz())
+
+fn string runtime_dir():
+    return os.getenv("CALENDAR_RUNTIME_DIR", "/run/user/" + os.getenv("CALENDAR_UID", "1000"))
+
+fn bool desktop_notify(string title, string body):
+    try:
+        Json res = await os.run(os.getenv("CALENDAR_NOTIFY_CMD", "notify-send"), ["-a", "Calendar", "-i", "calendar-desktop", "-u", "normal", "-t", "0", title, body], {
+            "timeout_ms": 5000,
+            "env": { "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + runtime_dir() + "/bus", "XDG_RUNTIME_DIR": runtime_dir() }
+        })
+        return res["status"] == 0
+    catch e:
+        return false
+
+fn string when_text(long eff, long now):
+    long mins = int((eff - now + 30000) / 60000)
+    if mins <= 0:
+        return "ahora"
+    if mins < 60:
+        return "en " + str(mins) + " min"
+    if mins < 1440:
+        return "en " + str(int(mins / 60)) + " h" + (mins % 60 == 0 ? "" : " " + str(mins % 60) + " min")
+    return "en " + str(int(mins / 1440)) + " d"
+
+fn bool check_reminders():
+    long now = time.now()
+    List<Json> rows = await sqlite.query("select * from events where reminders <> '[]'")
+    for Json r in rows:
+        List<int> rem = parse_json_text(r["reminders"], [])
+        if len(rem) == 0:
+            continue
+        int biggest = 0
+        for int m in rem:
+            if m > biggest:
+                biggest = m
+        long dur = r["end_ms"] - r["start_ms"]
+        # Apariciones cuyo inicio efectivo cae entre hace un minuto y el aviso más lejano.
+        long lo = now - 60000 - 86400000
+        long hi = now + biggest * 60000 + 86400000
+        List<int> starts = []
+        if r["rrule"] == "":
+            if r["start_ms"] >= lo and r["start_ms"] <= hi:
+                starts.add(r["start_ms"])
+        else:
+            starts = rrule.expand(r["rrule"], r["start_ms"], r["tzid"], parse_json_text(r["exdates"], []), lo, hi, 50)
+        for int s in starts:
+            long eff = effective_start(r, s)
+            if eff + 60000 < now:
+                continue
+            for int m in rem:
+                long fire = eff - m * 60000
+                if fire > now:
+                    continue
+                Json done = first(await sqlite.query("select notified from fired where event_id = ? and instance = ? and minutes = ?", r["id"], s, m))
+                if done != null and done["notified"] == 1:
+                    continue
+                string title = r["title"] == "" ? "(sin título)" : r["title"]
+                if done == null:
+                    await sqlite.exec("insert into fired (event_id, instance, minutes, at, notified) values (?, ?, ?, ?, 0)", r["id"], s, m, now)
+                    await sqlite.exec("insert into alerts (at, event_id, title, start_ms, minutes) values (?, ?, ?, ?, ?)", now, r["id"], title, eff, m)
+                string hour = r["all_day"] == 1 ? "Todo el día" : time.format(eff, "%H:%M", local_tz())
+                string body = hour + " · " + when_text(eff, now)
+                if r["location"] != "":
+                    body = body + " · " + r["location"]
+                if await desktop_notify(title, body):
+                    await sqlite.exec("update fired set notified = 1 where event_id = ? and instance = ? and minutes = ?", r["id"], s, m)
+    # Lo antiguo ya no hace falta.
+    await sqlite.exec("delete from fired where at < ?", now - 14 * 86400000)
+    await sqlite.exec("delete from alerts where at < ?", now - 7 * 86400000)
+    return true

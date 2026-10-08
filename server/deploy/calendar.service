@@ -1,0 +1,48 @@
+[Unit]
+Description=Calendar — calendario autoalojado (Lux)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=calendar
+Group=calendar
+WorkingDirectory=/opt/calendar
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# El puerto y la ruta de la base de datos se leen de aquí.
+EnvironmentFile=/etc/calendar/calendar.env
+
+# El lanzador monta los argumentos de Lux a partir de ese fichero.
+ExecStart=/opt/calendar/run.sh
+
+Restart=on-failure
+RestartSec=5
+
+# Lux escucha sólo en 127.0.0.1 (app: host); nginx es quien lo expone.
+
+# --- Endurecimiento -------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Los blobs se guardan sin permisos para "otros".
+UMask=0027
+
+# Únicos directorios en los que el servicio puede escribir.
+ReadWritePaths=/var/lib/calendar
+StateDirectory=calendar
+
+# Límites: las subidas abren muchos descriptores y cada hilo de Lux, un bucle.
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

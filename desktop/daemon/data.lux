@@ -1,0 +1,253 @@
+# La réplica local: lectura, cambios hechos por el usuario y cola de envío.
+#
+# El usuario edita siempre sobre la réplica (así funciona sin red) y cada cambio se
+# apunta en `pending`; sync.lux los manda al servidor cuando puede. Una fila con un
+# cambio sin enviar está `dirty`, y mientras lo esté no la pisa lo que llegue del
+# servidor: gana lo local hasta que se envíe y el servidor decida (ver sync.lux).
+#
+# Un evento guarda su inicio y fin en UTC más la zona `tzid` en que se creó (las
+# repeticiones conservan la hora de pared en esa zona). Los de todo el día usan
+# siempre tzid UTC y medianoches UTC. Mismas reglas que el servidor: ver su
+# server/app/lib/calendar.lux.
+
+fn string sget(Json o, string k, string d):
+    return o.has(k) and o[k] != null ? str(o[k]) : d
+
+fn bool is_whole(Json v):
+    return v != null and regex.test("^-?[0-9]{1,15}$", str(v))
+
+fn bool is_id(string s):
+    return regex.test("^[A-Za-z0-9_-]{8,64}$", s)
+
+fn bool valid_tz(string tzid):
+    try:
+        time.format(0, "%Y", tzid)
+        return true
+    catch e:
+        return false
+
+fn string new_id():
+    return hash.uuid().replace("-", "")
+
+# ── Vistas ──────────────────────────────────────────────────────────────────
+
+fn Json cal_view(Json r):
+    return { "id": r["id"], "name": r["name"], "color": r["color"], "position": r["position"], "dirty": r["dirty"] == 1 }
+
+fn Json event_view(Json r):
+    return {
+        "id": r["id"], "calendar_id": r["calendar_id"], "master_id": r["master_id"],
+        "title": r["title"], "location": r["location"], "notes": r["notes"],
+        "start": r["start_ms"], "end": r["end_ms"], "all_day": r["all_day"] == 1,
+        "tzid": r["tzid"], "rrule": r["rrule"] == "" ? null : r["rrule"],
+        "exdates": parse_json_text(r["exdates"], []), "reminders": parse_json_text(r["reminders"], []),
+        "dirty": r["dirty"] == 1
+    }
+
+# Las apariciones de los eventos de `rows` que se solapan con [after, before): las
+# series ya expandidas, cada una con su `instance` (su inicio) como identificador.
+fn List<Json> occurrences_of(List<Json> rows, long after, long before, int limit):
+    List<Json> out = []
+    for Json r in rows:
+        long dur = r["end_ms"] - r["start_ms"]
+        if r["rrule"] == "":
+            if r["start_ms"] < before and r["end_ms"] > after:
+                Json o = event_view(r)
+                o["instance"] = r["start_ms"]
+                o["recurring"] = false
+                out.add(o)
+        else:
+            # Una repetición que empieza antes de `after` puede seguir en curso.
+            List<int> starts = rrule.expand(r["rrule"], r["start_ms"], r["tzid"], parse_json_text(r["exdates"], []), after - dur, before, limit)
+            for int s in starts:
+                if s + dur > after:
+                    Json o = event_view(r)
+                    o["start"] = s
+                    o["end"] = s + dur
+                    o["instance"] = s
+                    o["recurring"] = true
+                    out.add(o)
+        if len(out) >= limit:
+            break
+    return out
+
+fn List<Json> visible_occurrences(long after, long before):
+    List<Json> rows = await sqlite.query(
+        "select e.* from events e join calendars c on c.id = e.calendar_id where e.start_ms < ? and (e.rrule <> '' or e.end_ms > ?)",
+        before, after)
+    return occurrences_of(rows, after, before, 5000)
+
+fn List<Json> calendars_list():
+    List<Json> out = []
+    for Json c in await sqlite.query("select * from calendars order by position, name"):
+        out.add(cal_view(c))
+    return out
+
+# ── Cola de envío ───────────────────────────────────────────────────────────
+
+fn bool is_pending(string id):
+    return len(await sqlite.query("select seq from pending where target_id = ?", id)) > 0
+
+# Apunta un cambio a enviar. Sustituye al anterior sobre el mismo elemento: lo que
+# importa es el último estado, no cada paso.
+fn bool enqueue(string target_id, Json op):
+    await sqlite.exec("delete from pending where target_id = ?", target_id)
+    await sqlite.exec("insert into pending (target_id, op, edited_at) values (?, ?, ?)", target_id, json.stringify(op), time.now())
+    state.set("sync_now", 1)
+    return true
+
+fn int pending_count():
+    return (await sqlite.query("select count(*) as n from pending"))[0]["n"]
+
+# ── Validación local ────────────────────────────────────────────────────────
+# Para avisar al instante; el servidor vuelve a comprobarlo todo.
+
+fn string check_event(Json op):
+    string title = sget(op, "title", "")
+    if len(title) > 500 or len(sget(op, "location", "")) > 500 or len(sget(op, "notes", "")) > 20000:
+        return "el título, el lugar o las notas son demasiado largos"
+    if not is_whole(op["start"]) or not is_whole(op["end"]):
+        return "las fechas no son válidas"
+    if int(op["end"]) < int(op["start"]):
+        return "el evento no puede acabar antes de empezar"
+    if op.has("all_day") and op["all_day"] == true:
+        if int(op["start"]) % 86400000 != 0 or int(op["end"]) % 86400000 != 0 or int(op["end"]) == int(op["start"]):
+            return "un evento de todo el día empieza y acaba en medianoches UTC"
+    else:
+        if not valid_tz(sget(op, "tzid", "UTC")):
+            return "zona horaria desconocida: " + sget(op, "tzid", "UTC")
+    string rule = sget(op, "rrule", "").trim()
+    if rule != "":
+        string why = rrule.check(rule)
+        if why != "":
+            return why
+    if op.has("reminders") and op["reminders"] != null:
+        if len(op["reminders"]) > 10:
+            return "como mucho 10 avisos"
+        for Json m in op["reminders"]:
+            if not is_whole(m) or int(m) < 0 or int(m) > 40320:
+                return "los avisos son minutos entre 0 y 40320"
+    return ""
+
+# ── Cambios locales ─────────────────────────────────────────────────────────
+
+fn Json local_cal_put(Json op):
+    string id = sget(op, "id", new_id())
+    string name = sget(op, "name", "").trim()
+    string color = sget(op, "color", "#d97757").lower()
+    if not is_id(id):
+        return { "ok": false, "error": "id no válido" }
+    if name == "" or len(name) > 100:
+        return { "ok": false, "error": "el nombre debe tener entre 1 y 100 caracteres" }
+    if not regex.test("^#[0-9a-f]{6}$", color):
+        return { "ok": false, "error": "el color debe ser #rrggbb" }
+    int position = is_whole(op["position"]) ? int(op["position"]) : 0
+    Json cur = first(await sqlite.query("select * from calendars where id = ?", id))
+    long now = time.now()
+    if cur == null:
+        await sqlite.exec("insert into calendars (id, name, color, position, rev, updated_at, dirty) values (?, ?, ?, ?, 0, ?, 1)", id, name, color, position, now)
+    else:
+        await sqlite.exec("update calendars set name = ?, color = ?, position = ?, updated_at = ?, dirty = 1 where id = ?", name, color, position, now, id)
+    Json out = { "op": "cal.put", "id": id, "name": name, "color": color, "position": position }
+    if cur != null and cur["rev"] > 0:
+        out["base_rev"] = cur["rev"]
+    await enqueue(id, out)
+    return { "ok": true, "id": id }
+
+fn Json local_cal_delete(Json op):
+    string id = sget(op, "id", "")
+    Json cur = first(await sqlite.query("select * from calendars where id = ?", id))
+    if cur == null:
+        return { "ok": true }
+    # Sus eventos se van con él, y sus cambios por enviar ya no importan.
+    for Json e in await sqlite.query("select id from events where calendar_id = ?", id):
+        await sqlite.exec("delete from pending where target_id = ?", e["id"])
+    await sqlite.exec("delete from events where calendar_id = ?", id)
+    await sqlite.exec("delete from calendars where id = ?", id)
+    await sqlite.exec("delete from pending where target_id = ?", id)
+    # Si nunca llegó al servidor no hay nada que borrar allí.
+    if cur["rev"] > 0:
+        await enqueue(id, { "op": "cal.delete", "id": id, "base_rev": cur["rev"] })
+    return { "ok": true }
+
+fn Json local_event_put(Json op):
+    string id = sget(op, "id", new_id())
+    string calendar_id = sget(op, "calendar_id", "")
+    string master_id = sget(op, "master_id", "")
+    if not is_id(id):
+        return { "ok": false, "error": "id no válido" }
+    string why = check_event(op)
+    if why != "":
+        return { "ok": false, "error": why }
+    if len(await sqlite.query("select id from calendars where id = ?", calendar_id)) == 0:
+        return { "ok": false, "error": "el calendario no existe" }
+    bool all_day = op.has("all_day") and op["all_day"] == true
+    string tzid = all_day ? "UTC" : sget(op, "tzid", "UTC")
+    string rule = sget(op, "rrule", "").trim()
+    List<int> exdates = []
+    if op.has("exdates") and op["exdates"] != null:
+        for Json x in op["exdates"]:
+            exdates.add(int(x))
+    List<int> reminders = []
+    if op.has("reminders") and op["reminders"] != null:
+        for Json m in op["reminders"]:
+            reminders.add(int(m))
+    Json mid = master_id == "" ? null : master_id
+    Json cur = first(await sqlite.query("select * from events where id = ?", id))
+    long now = time.now()
+    if cur == null:
+        await sqlite.exec(
+            "insert into events (id, calendar_id, master_id, title, location, notes, start_ms, end_ms, all_day, tzid, rrule, exdates, reminders, rev, updated_at, dirty) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 1)",
+            id, calendar_id, mid, sget(op, "title", "").trim(), sget(op, "location", "").trim(), sget(op, "notes", ""), int(op["start"]), int(op["end"]),
+            all_day ? 1 : 0, tzid, rule, json.stringify(exdates), json.stringify(reminders), now)
+    else:
+        await sqlite.exec(
+            "update events set calendar_id = ?, master_id = ?, title = ?, location = ?, notes = ?, start_ms = ?, end_ms = ?, all_day = ?, tzid = ?, rrule = ?, exdates = ?, reminders = ?, updated_at = ?, dirty = 1 where id = ?",
+            calendar_id, mid, sget(op, "title", "").trim(), sget(op, "location", "").trim(), sget(op, "notes", ""), int(op["start"]), int(op["end"]),
+            all_day ? 1 : 0, tzid, rule, json.stringify(exdates), json.stringify(reminders), now, id)
+    Json out = {
+        "op": "event.put", "id": id, "calendar_id": calendar_id, "title": sget(op, "title", "").trim(),
+        "location": sget(op, "location", "").trim(), "notes": sget(op, "notes", ""),
+        "start": int(op["start"]), "end": int(op["end"]), "all_day": all_day, "tzid": tzid,
+        "rrule": rule, "exdates": exdates, "reminders": reminders
+    }
+    if master_id != "":
+        out["master_id"] = master_id
+    if cur != null and cur["rev"] > 0:
+        out["base_rev"] = cur["rev"]
+    await enqueue(id, out)
+    return { "ok": true, "id": id }
+
+fn Json local_event_delete(Json op):
+    string id = sget(op, "id", "")
+    Json cur = first(await sqlite.query("select * from events where id = ?", id))
+    if cur == null:
+        return { "ok": true }
+    # Borrar una serie borra sus excepciones.
+    for Json e in await sqlite.query("select id from events where master_id = ?", id):
+        await sqlite.exec("delete from pending where target_id = ?", e["id"])
+    await sqlite.exec("delete from events where master_id = ?", id)
+    await sqlite.exec("delete from events where id = ?", id)
+    await sqlite.exec("delete from pending where target_id = ?", id)
+    if cur["rev"] > 0:
+        await enqueue(id, { "op": "event.delete", "id": id, "base_rev": cur["rev"] })
+    return { "ok": true }
+
+# Aplica un lote de cambios del usuario a la réplica. Cada uno responde por separado.
+fn List<Json> local_apply(List<Json> ops):
+    List<Json> results = []
+    await sqlite.begin()
+    for Json op in ops:
+        switch sget(op, "op", ""):
+            case "cal.put":
+                results.add(await local_cal_put(op))
+            case "cal.delete":
+                results.add(await local_cal_delete(op))
+            case "event.put":
+                results.add(await local_event_put(op))
+            case "event.delete":
+                results.add(await local_event_delete(op))
+            else:
+                results.add({ "ok": false, "error": "operación desconocida: " + sget(op, "op", "") })
+    await sqlite.commit()
+    return results

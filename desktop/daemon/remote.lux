@@ -1,0 +1,37 @@
+# Cliente de la API del servidor de Calendar.
+#
+# Todas devuelven {"status": n, "body": ...}; con status 0 es que no hubo respuesta
+# (sin red, servidor caído, TLS que no cuadra) y en body.error va el motivo.
+
+fn string server_url():
+    return await setting("server_url", "")
+
+fn Json remote(string method, string path, Json body):
+    string base = await server_url()
+    string token = await setting("token", "")
+    if base == "" or token == "":
+        return { "status": 0, "body": { "error": "sin configurar" } }
+    Json headers = { "Authorization": "Bearer " + token }
+    try:
+        Json r = null
+        if method == "GET":
+            r = await http.get(base + path, headers, { "timeout_ms": 15000 })
+        else:
+            r = await http.post(base + path, body, headers, { "timeout_ms": 30000 })
+        return r
+    catch e:
+        return { "status": 0, "body": { "error": e.message } }
+
+# Inicia sesión y devuelve el token. {"ok": bool, "token": ..., "username": ..., "error": ..., "totp_required": bool}
+fn Json remote_login(string url, string username, string password, string code, string device):
+    Json payload = { "username": username, "password": password, "name": device }
+    if code != "":
+        payload["totp"] = code
+    try:
+        Json r = await http.post(url + "/api/login", payload, {}, { "timeout_ms": 15000 })
+        if r["status"] == 200 and r["body"] != null and r["body"]["token"] != null:
+            return { "ok": true, "token": r["body"]["token"], "username": r["body"]["user"]["username"] }
+        string detail = r["body"] != null and r["body"]["detail"] != null ? str(r["body"]["detail"]) : "el servidor respondió " + str(r["status"])
+        return { "ok": false, "error": detail, "totp_required": r["body"] != null and r["body"]["totp_required"] == true }
+    catch e:
+        return { "ok": false, "error": "no se pudo contactar con el servidor: " + e.message, "totp_required": false }
