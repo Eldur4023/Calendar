@@ -104,13 +104,4 @@ endfunction()
 # app/ is where the work happens: app.lux, templates/, static assets, window
 # title/size (via the window: block) -- everything. This line is the only
 # thing in this file that ever names it.
-add_lux_desktop_app(calendar DIR ${CMAKE_CURRENT_SOURCE_DIR}/app ID calendar)
-
-# ── Dev mode (src/dev.cpp) ───────────────────────────────────────────────
-# Reads app/ straight off disk and hot-reloads it through LuxScript's own
-# compiler -- no respack, no rebuilding THIS binary after editing app.lux, a
-# template or a static file. Run ./build/app-dev while you work.
-add_executable(calendar-dev src/dev.cpp src/desktop_window.cpp)
-target_compile_definitions(calendar-dev PRIVATE
-    LUXDESKTOP_APP_DIR="${CMAKE_CURRENT_SOURCE_DIR}/app")
-_lux_desktop_link(calendar-dev)
+add_lux_desktop_app(calendar-desktop DIR ${CMAKE_CURRENT_SOURCE_DIR}/app ID calendar-desktop)

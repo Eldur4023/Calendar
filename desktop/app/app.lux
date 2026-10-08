@@ -1,0 +1,173 @@
+# Calendar — la ventana de escritorio.
+#
+# No guarda ni sincroniza nada por sí misma: es la interfaz del servicio
+# (../daemon), que corre aparte como servicio de sistema y es quien tiene la
+# réplica del calendario, la sincroniza y lanza los avisos. Esta app sólo pinta,
+# abre la bandeja y busca actualizaciones. Todo lo demás son llamadas a la API
+# local del servicio, con su secreto leído del fichero `api-token` (así no pasa
+# por el navegador).
+
+import window
+import os
+import http
+import json
+
+app:
+    name   "Calendar"
+    # Sólo esta máquina: el runtime de escritorio se niega a arrancar si no.
+    host   "127.0.0.1"
+    max_body "1MB"
+
+    window:
+        title     "Calendar"
+        width     1180
+        height    780
+        resizable true
+        icon      "./icon.png"
+
+    static "/" -> "./public" spa
+
+# Dónde habla y dónde está el secreto: los mismos ajustes que usa el servicio.
+fn string daemon_url():
+    return "http://127.0.0.1:" + os.getenv("CALENDAR_DAEMON_PORT", "7879")
+
+fn string secret_path():
+    return os.path_join(os.getenv("CALENDAR_DAEMON_HOME", "/var/lib/calendar-daemon"), "api-token")
+
+# Llama al servicio y devuelve {status, body}. Si no contesta, lo explica.
+fn Json daemon(string method, string path, Json body):
+    try:
+        string secret = await os.read_file(secret_path())
+        Json headers = { "X-Calendar-Token": secret.trim() }
+        Json r = null
+        if method == "GET":
+            r = await http.get(daemon_url() + path, headers, { "timeout_ms": 20000 })
+        else:
+            r = await http.post(daemon_url() + path, body, headers, { "timeout_ms": 60000 })
+        return r
+    catch e:
+        return { "status": 503, "body": { "detail": "El servicio de Calendar no responde. ¿Está en marcha? (systemctl status calendar-daemon)" } }
+
+get endpoint("/api/status"):
+    Json r = await daemon("GET", "/api/status", null)
+    return r["body"].status(r["status"])
+
+post endpoint("/api/settings", Json body):
+    Json r = await daemon("POST", "/api/settings", body)
+    return r["body"].status(r["status"])
+
+post endpoint("/api/logout"):
+    Json r = await daemon("POST", "/api/logout", {})
+    return r["body"].status(r["status"])
+
+get endpoint("/api/data", long after, long before):
+    Json r = await daemon("GET", "/api/data?after=" + str(after) + "&before=" + str(before), null)
+    return r["body"].status(r["status"])
+
+get endpoint("/api/events/:id", string id):
+    Json r = await daemon("GET", "/api/events/" + http.url_encode(id), null)
+    return r["body"].status(r["status"])
+
+post endpoint("/api/ops", Json body):
+    Json r = await daemon("POST", "/api/ops", body)
+    return r["body"].status(r["status"])
+
+post endpoint("/api/sync"):
+    Json r = await daemon("POST", "/api/sync", {})
+    return r["body"].status(r["status"])
+
+get endpoint("/api/log"):
+    Json r = await daemon("GET", "/api/log", null)
+    return r["body"].status(r["status"])
+
+get endpoint("/api/alerts", long since = 0):
+    Json r = await daemon("GET", "/api/alerts?since=" + str(since), null)
+    return r["body"].status(r["status"])
+
+# Icono en la bandeja del sistema (clic: muestra u oculta la ventana). Lo pide la
+# propia página al cargar, cuando la ventana ya existe.
+post endpoint("/api/chrome"):
+    window.set_tray("./icon.png", "Calendar")
+    return status(204)
+
+# --- Actualizaciones desde GitHub ------------------------------------------
+# install.sh deja en /opt/calendar-desktop de qué repositorio y commit se instaló;
+# la app compara ese commit con el de GitHub y, si hay cambios, lanza
+# deploy/update.sh (pull, compilar y `pkexec install.sh`) en segundo plano.
+
+fn string opt_dir():
+    return os.getenv("CALENDAR_DESKTOP_OPT", "/opt/calendar-desktop")
+
+fn string update_log():
+    return os.path_join(os.getenv("HOME", "/tmp"), ".cache/calendar-update.log")
+
+fn string source_repo():
+    if not os.path_exists(opt_dir() + "/source"):
+        return ""
+    string repo = await os.read_file(opt_dir() + "/source")
+    return repo.trim()
+
+# git sin preguntar nunca credenciales por terminal (no hay terminal: se colgaría).
+fn Json git(string repo, List<string> args, int timeout):
+    List<string> argv = ["-C", repo]
+    for string arg in args:
+        argv.add(arg)
+    return await os.run("git", argv, { "timeout_ms": timeout, "env": { "GIT_TERMINAL_PROMPT": "0" } })
+
+get endpoint("/api/update"):
+    string repo = await source_repo()
+    if repo == "" or not os.is_dir(repo):
+        return { "available": false, "error": "instalación sin repositorio de origen (reinstala con deploy/install.sh)" }
+    string current = ""
+    if os.path_exists(opt_dir() + "/version"):
+        string v = await os.read_file(opt_dir() + "/version")
+        current = v.trim()
+    if current == "":
+        Json head = await git(repo, ["rev-parse", "HEAD"], 5000)
+        current = str(head["stdout"]).trim()
+    Json f = await git(repo, ["fetch", "-q"], 60000)
+    if f["status"] != 0:
+        return { "available": false, "error": "no se pudo consultar GitHub: " + str(f["stderr"]).trim() }
+    Json log = await git(repo, ["log", "--format=%h %s", current + "..@{u}"], 5000)
+    List<string> commits = []
+    List<string> lines = str(log["stdout"]).split("\n")
+    for string line in lines:
+        if line.trim() != "":
+            commits.add(line.trim())
+    return { "available": len(commits) > 0, "commits": commits }
+
+post endpoint("/api/update"):
+    string repo = await source_repo()
+    if repo == "":
+        return { "ok": false, "error": "no se sabe desde dónde se instaló" }.status(400)
+    os.make_dir(os.path_dirname(update_log()))
+    # setsid -f: el script sigue aunque se cierre la ventana; la salida, al registro.
+    await os.run("setsid", ["-f", "bash", "-c", "exec bash \"$0\" > \"$1\" 2>&1 < /dev/null",
+        os.path_join(repo, "desktop/deploy/update.sh"), update_log()],
+        { "timeout_ms": 5000, "env": { "GIT_TERMINAL_PROMPT": "0" } })
+    return { "ok": true }
+
+get endpoint("/api/update/log"):
+    if not os.path_exists(update_log()):
+        return { "state": "idle", "log": "" }
+    string text = await os.read_file(update_log())
+    string state = "running"
+    if text.contains("==> LISTO"):
+        state = "done"
+    else if text.contains("==> ERROR"):
+        state = "error"
+    if len(text) > 4000:
+        text = text.slice(len(text) - 4000, len(text))
+    return { "state": state, "log": text }
+
+# Tras actualizar: abre la versión nueva y cierra esta.
+post endpoint("/api/restart"):
+    # Sin redirigir, la app nueva hereda nuestra salida y os.run espera hasta el
+    # timeout: lanza un error y window.close() no llega a ejecutarse.
+    await os.run("setsid", ["-f", "sh", "-c", "exec > /dev/null 2>&1 < /dev/null; sleep 1; exec /usr/local/bin/calendar-desktop"], { "timeout_ms": 5000 })
+    window.close()
+    return { "ok": true }
+
+# Una ruta de la API que no existe es un 404, no la página de inicio (spa lo tragaría).
+any endpoint("/api/*"):
+    return status(404)
