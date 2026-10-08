@@ -1,7 +1,7 @@
 [Unit]
 Description=Calendar — calendario autoalojado (Lux)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
 
 [Service]
 Type=exec
@@ -19,7 +19,7 @@ ExecStart=/opt/calendar/run.sh
 Restart=on-failure
 RestartSec=5
 
-# Lux escucha sólo en 127.0.0.1 (app: host); nginx es quien lo expone.
+# Lux escucha sólo en la IP de Tailscale (CALENDAR_HOST, de calendar.env): ni LAN ni Internet.
 
 # --- Endurecimiento -------------------------------------------------------
 NoNewPrivileges=yes

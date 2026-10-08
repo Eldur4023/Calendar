@@ -8,8 +8,8 @@
 #
 # Variables de entorno (las lee run.sh desde /etc/calendar/calendar.env):
 #   CALENDAR_DB        fichero SQLite (obligatoria; se resuelve al compilar)
-#   CALENDAR_HOST      dirección de escucha (127.0.0.1: nginx es quien lo expone)
-#   CALENDAR_PROXY     1 si hay un proxy delante y se fía de X-Forwarded-For
+#   CALENDAR_HOST      dirección de escucha: SIEMPRE la IP de Tailscale (el instalador la pone); Calendar no se expone a Internet
+#   CALENDAR_PROXY     1 sólo si algún día hay un proxy delante y se fía de X-Forwarded-For (0)
 #   CALENDAR_TIMEZONE  zona de las fechas de los avisos del registro (Europe/Madrid)
 
 import sqlite

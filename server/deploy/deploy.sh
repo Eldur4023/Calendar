@@ -217,10 +217,8 @@ Siguientes pasos, en el servidor:
   # Tu cuenta
   sudo calendar-cli createuser TUNOMBRE
 
-Ahora escucha en 127.0.0.1:8100, sin cifrar y sin acceso desde fuera. Lux no
-sirve TLS: para exponerlo se pone nginx delante (lo instala el script):
-
-  sudo bash /opt/calendar/deploy/setup-tls.sh letsencrypt tu.dominio tu@correo 443
-  sudo bash /opt/calendar/deploy/setup-tls.sh self-signed 192.168.1.20 4023
+Calendar escucha SÓLO en la IP de Tailscale del servidor (puerto 8100): no está expuesto a
+Internet ni a la LAN. En el cliente de escritorio, la dirección del servidor es
+http://<IP de Tailscale>:8100.
 FIN
 fi

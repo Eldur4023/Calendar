@@ -6,10 +6,10 @@ Son dos piezas, las dos en [Lux](vendor/lux) y **sin ninguna dependencia de Driv
 
 ```
  tu equipo                                          tu servidor (el mismo que Drive)
-┌─────────────────────────────┐   HTTPS + token    ┌──────────────────────────────────┐
+┌─────────────────────────────┐   Tailscale + token    ┌──────────────────────────────────┐
 │ calendar-desktop  (ventana) │                    │ calendar  (Lux, systemd)         │
 │        │ HTTP, sólo 127.0.0.1                    │  SQLite propia · puerto 8100     │
-│        ▼                    │                    │  nginx delante para el TLS       │
+│        ▼                    │                    │  sólo en la IP de Tailscale      │
 │ calendar-daemon  (servicio) │ ─────────────────► │                                  │
 │  réplica local + cola       │ ◄───────────────── │                                  │
 │  sincroniza y lanza avisos  │                    └──────────────────────────────────┘
@@ -46,14 +46,15 @@ Compila `build/vendor/lux/lux` (Lux, con el módulo nativo `rrule`) y `build/cal
 ```bash
 ./server/deploy/deploy.sh usuario@servidor          # instala; la segunda vez sólo actualiza
 ssh -t usuario@servidor sudo calendar-cli createuser TUNOMBRE
-ssh usuario@servidor sudo bash /opt/calendar/deploy/setup-tls.sh letsencrypt calendar.tudominio tu@correo 443
 ```
 
-`deploy.sh` empaqueta la app y el binario de Lux, los envía por SSH y ejecuta el instalador. **Convive con Drive**: usuario `calendar`, `/opt/calendar`, `/var/lib/calendar`, puerto 8100 y su **propio** binario de Lux (`/opt/calendar/lux`); no toca el `lux` del sistema. Al actualizar conserva la base de datos y `calendar.env`, y si el servicio no arranca vuelve solo a la versión anterior (`--dry-run` enseña lo que haría). Con nginx delante y otro nombre que Drive, comparten el 443.
+`deploy.sh` empaqueta la app y el binario de Lux, los envía por SSH y ejecuta el instalador. **Convive con Drive**: usuario `calendar`, `/opt/calendar`, `/var/lib/calendar`, puerto 8100 y su **propio** binario de Lux (`/opt/calendar/lux`); no toca el `lux` del sistema. Al actualizar conserva la base de datos y `calendar.env`, y si el servicio no arranca vuelve solo a la versión anterior (`--dry-run` enseña lo que haría).
 
 Órdenes de administración (`calendar-cli`): `createuser`, `passwd` (cierra las sesiones abiertas), `listusers`, `totp NOMBRE [--off]`, `disable`, `maintenance`.
 
-Variables en `/etc/calendar/calendar.env`: `CALENDAR_DB`, `BIND_PORT`, `CALENDAR_HOST` (127.0.0.1), `CALENDAR_PROXY` (1 si hay nginx delante).
+Variables en `/etc/calendar/calendar.env`: `CALENDAR_DB`, `BIND_PORT`, `CALENDAR_HOST` (**la IP de Tailscale del servidor, siempre**: el instalador la lee con `tailscale ip -4` y se niega a instalar sin ella; `run.sh` se niega a arrancar con `0.0.0.0` y espera a que tailscaled ponga la IP tras un reinicio), `CALENDAR_PROXY` (0).
+
+**Calendar no se expone a Internet ni a la LAN**: no lleva nginx ni TLS (el tráfico por Tailscale ya va cifrado con WireGuard). En el cliente de escritorio, la dirección del servidor es `http://<IP de Tailscale>:8100`, o `http://calendar.lan` si das de alta ese nombre en el nginx de tu equipo: `sudo ./desktop/deploy/nginx-local.sh` (instala [calendar.lan.nginx.conf](desktop/deploy/calendar.lan.nginx.conf) y añade `127.0.0.1 calendar.lan` a `/etc/hosts`; `--quitar` lo deshace). Todos los clientes que pasen por ese nginx comparten IP de cara a Calendar (el bloqueo por intentos fallidos es por IP).
 
 ## Estado para QuemaOS
 
@@ -107,7 +108,7 @@ Lux no trae RRULE, así que se añadió un módulo nativo ([rrule.cpp](vendor/lu
 vendor/lux/                      Lux (copia de la de Drive de escritorio) + módulo rrule
 server/quemaos/                  la sonda de QuemaOS (app Lux aparte)
 server/app/                      app.lux · lib/{db,auth,calendar,maintenance}.lux · routes/{api,commands}.lux
-server/deploy/                   install · remote-update (con vuelta atrás) · deploy · calendar-cli · nginx · setup-tls
+server/deploy/                   install · remote-update (con vuelta atrás) · deploy · calendar-cli
 desktop/daemon/                  store · remote · data · sync · reminders · api
 desktop/app/                     app.lux (ventana y actualizaciones) · public/{index.html,style.css,logic.js,app.js}
 desktop/{src,include,third_party,tools}/   el shell GTK/WebKit (de Lux Desktop)

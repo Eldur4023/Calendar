@@ -27,7 +27,7 @@ Cambios respecto al plan inicial: el día 31 en una serie mensual **se salta** l
 
 ## Sonda de QuemaOS y despliegue (2026-10-08)
 
-Contrato, reglas y puertos en `~/Escritorio/Suite-Canon.md` (§5 y §6). Calendar: proceso aparte `server/quemaos` en el **9705**. Drive: app Lux aparte en el 9704. Homeflix: relé Lux en el 9700. **Desplegado en el servidor** (`burnt-server`, por Tailscale): Calendar (instalación nueva, sólo en 127.0.0.1:8100), Drive (actualizado) y las tres sondas; el código de descubrimiento de QuemaOS las ve las cinco.
+Contrato, reglas y puertos en `~/Escritorio/Suite-Canon.md` (§5 y §6). Calendar: proceso aparte `server/quemaos` en el **9705**. Drive: app Lux aparte en el 9704. Homeflix: relé Lux en el 9700. **Desplegado en el servidor** (`burnt-server`, por Tailscale): Calendar (instalación nueva; ahora **sólo en la IP de Tailscale**, 100.89.87.71:8100), Drive (actualizado) y las tres sondas; el código de descubrimiento de QuemaOS las ve las cinco.
 
 ## Sin hacer / pendiente de probar
 

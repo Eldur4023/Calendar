@@ -97,6 +97,11 @@ install -m 755 "$SOURCE_DIR/deploy/run.sh" "$APP_DIR/run.sh"
 install -m 755 "$SOURCE_DIR/deploy/quemaos-run.sh" "$APP_DIR/quemaos-run.sh"
 cp "$SOURCE_DIR/deploy/calendar.service" /etc/systemd/system/calendar.service
 cp "$SOURCE_DIR/deploy/calendar-quemaos.service" /etc/systemd/system/calendar-quemaos.service
+# Calendar escucha SÓLO en la IP de Tailscale. Instalaciones anteriores (127.0.0.1) se migran aquí.
+TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+[[ -n "$TS_IP" ]] || { echo "No encuentro la IP de Tailscale: Calendar sólo escucha ahí." >&2; false; }
+if grep -q '^CALENDAR_HOST=' "$ENV_FILE"; then sed -i "s/^CALENDAR_HOST=.*/CALENDAR_HOST=$TS_IP/" "$ENV_FILE"; else printf 'CALENDAR_HOST=%s\n' "$TS_IP" >> "$ENV_FILE"; fi
+if grep -q '^CALENDAR_PROXY=' "$ENV_FILE"; then sed -i 's/^CALENDAR_PROXY=.*/CALENDAR_PROXY=0/' "$ENV_FILE"; else echo 'CALENDAR_PROXY=0' >> "$ENV_FILE"; fi
 # Instalaciones anteriores a la sonda: se añade su puerto a calendar.env sin tocar lo demás.
 grep -q '^CALENDAR_QUEMAOS_PORT=' "$ENV_FILE" || printf '\n# Sonda de QuemaOS (rango 9700-9799 de la suite). 0.0.0.0 en CALENDAR_QUEMAOS_HOST la abre a la red.\nCALENDAR_QUEMAOS_PORT=9705\n' >> "$ENV_FILE"
 install -m 755 "$SOURCE_DIR/deploy/calendar-cli.sh" /usr/local/bin/calendar-cli
@@ -112,7 +117,7 @@ systemctl start calendar
 echo "==> Esperando a que responda"
 ok=0
 for _ in $(seq 1 20); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:$HEALTH_PORT/healthz" >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 "http://$TS_IP:$HEALTH_PORT/healthz" >/dev/null 2>&1; then
         ok=1
         break
     fi
@@ -126,4 +131,4 @@ systemctl start calendar-quemaos || echo "aviso: calendar-quemaos no arrancó (j
 trap - ERR
 rm -rf "$PREVIOUS"
 echo
-echo "Calendar actualizado y respondiendo en http://127.0.0.1:$HEALTH_PORT"
+echo "Calendar actualizado y respondiendo en http://$TS_IP:$HEALTH_PORT"

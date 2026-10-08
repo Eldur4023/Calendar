@@ -19,7 +19,8 @@ if ! [[ "$PORT" =~ ^97[0-9][0-9]$ ]]; then
     exit 1
 fi
 export CALENDAR_DB="${CALENDAR_DB:-/var/lib/calendar/calendar.db}"
-export CALENDAR_URL="${CALENDAR_URL:-http://127.0.0.1:${BIND_PORT:-8100}}"
+# Calendar escucha en la IP de Tailscale, no en 127.0.0.1: la sonda lo comprueba ahí.
+export CALENDAR_URL="${CALENDAR_URL:-http://${CALENDAR_HOST:-127.0.0.1}:${BIND_PORT:-8100}}"
 export CALENDAR_QUEMAOS_PORT="$PORT"
 
 echo "Sonda de QuemaOS en http://${CALENDAR_QUEMAOS_HOST:-127.0.0.1}:$PORT/quemaos/status"

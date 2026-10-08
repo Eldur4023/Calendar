@@ -4,8 +4,9 @@
 #
 #   sudo bash deploy/install.sh
 #
-# Deja el servicio escuchando en 127.0.0.1:8100 bajo systemd. El TLS (nginx) se
-# configura aparte con deploy/setup-tls.sh. Convive con Drive en la misma máquina:
+# Deja el servicio escuchando en la IP de TAILSCALE del servidor (puerto 8100) bajo systemd, y
+# SÓLO ahí: Calendar no se expone a la LAN ni a Internet, y no lleva nginx ni TLS (el tráfico por
+# Tailscale ya va cifrado). Convive con Drive en la misma máquina:
 # otro usuario, otro puerto, otra base de datos y SU PROPIO binario de Lux
 # (/opt/calendar/lux, con el módulo rrule), sin tocar el /usr/local/bin/lux de Drive.
 #
@@ -34,13 +35,22 @@ if [[ -z "$LUX_SRC_BIN" || ! -f "$LUX_SRC_BIN" ]]; then
     exit 1
 fi
 
+echo "==> Buscando la IP de Tailscale"
+TS_IP=""
+command -v tailscale >/dev/null 2>&1 && TS_IP="$(tailscale ip -4 2>/dev/null | head -1)"
+if [[ -z "$TS_IP" ]]; then
+    echo "No encuentro la IP de Tailscale (¿está tailscaled en marcha?). Calendar sólo escucha ahí." >&2
+    exit 1
+fi
+echo "    $TS_IP"
+
 echo "==> Instalando dependencias del sistema"
 apt-get update -qq
-# Bibliotecas que enlaza el binario de Lux, nginx para el TLS, openssl, libargon2
+# Bibliotecas que enlaza el binario de Lux, openssl, libargon2
 # (hashes de contraseña), tzdata (zonas horarias de las repeticiones) y qrencode,
 # opcional, para dibujar el QR del segundo factor.
 apt-get install -y --no-install-recommends \
-    ca-certificates curl openssl nginx qrencode \
+    ca-certificates curl openssl qrencode \
     libsqlite3-0 libcurl4 libwebp7 libpng16-16 libjpeg-turbo8 libcairo2 \
     libjemalloc2 libpq5 libmysqlclient21 zlib1g libargon2-1 tzdata
 
@@ -60,8 +70,7 @@ install -m 755 "$LUX_SRC_BIN" "$APP_DIR/lux"
 cp "$SOURCE_DIR/deploy/run.sh" "$APP_DIR/run.sh"
 cp "$SOURCE_DIR/deploy/quemaos-run.sh" "$APP_DIR/quemaos-run.sh"
 chmod 755 "$APP_DIR/run.sh" "$APP_DIR/quemaos-run.sh"
-# Los scripts de operación quedan en el servidor: setup-tls.sh y la plantilla de
-# nginx hacen falta después de instalar, no sólo durante.
+# Los scripts de operación quedan en el servidor.
 cp -r "$SOURCE_DIR/deploy" "$APP_DIR/deploy"
 rm -f "$APP_DIR/deploy/lux"
 
@@ -79,10 +88,11 @@ if [[ ! -f "$ENV_DIR/calendar.env" ]]; then
 # Configuración de Calendar. Lo lee systemd y deploy/calendar-cli.sh.
 CALENDAR_DB=$DATA_DIR/calendar.db
 
-# Puerto de Lux (lo lee run.sh). Escucha sólo en el bucle local; nginx lo expone
-# (deploy/setup-tls.sh). Con nginx delante déjalo en 1: se fía de X-Forwarded-For.
+# Dónde escucha Lux (lo lee run.sh): SÓLO la IP de Tailscale de este servidor. No se expone a la
+# LAN ni a Internet; si la IP de Tailscale cambiara, actualiza CALENDAR_HOST y reinicia.
 BIND_PORT=8100
-CALENDAR_PROXY=1
+CALENDAR_HOST=$TS_IP
+CALENDAR_PROXY=0
 
 # Sonda de estado para QuemaOS: su propio puerto, del rango 9700-9799 de la suite. Escucha sólo en
 # 127.0.0.1; pon CALENDAR_QUEMAOS_HOST=0.0.0.0 si QuemaOS la consulta desde otra máquina.
@@ -111,7 +121,7 @@ PUERTO="$(grep -E '^BIND_PORT=' "$ENV_DIR/calendar.env" | cut -d= -f2)"
 PUERTO="${PUERTO:-8100}"
 
 for _ in $(seq 1 20); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:$PUERTO/healthz" >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 "http://$TS_IP:$PUERTO/healthz" >/dev/null 2>&1; then
         break
     fi
     sleep 1
@@ -128,8 +138,8 @@ if curl -fsS --max-time 3 "http://127.0.0.1:$QPORT/quemaos/status" >/dev/null 2>
 else
     echo "aviso: la sonda de QuemaOS no responde (journalctl -u calendar-quemaos)" >&2
 fi
-if curl -fsS --max-time 3 "http://127.0.0.1:$PUERTO/healthz" >/dev/null 2>&1; then
-    echo "Calendar responde en http://127.0.0.1:$PUERTO"
+if curl -fsS --max-time 3 "http://$TS_IP:$PUERTO/healthz" >/dev/null 2>&1; then
+    echo "Calendar responde en http://$TS_IP:$PUERTO"
 else
     echo "El servicio no responde todavía. Revisa:" >&2
     echo "  systemctl status calendar; journalctl -u calendar -n 50" >&2
@@ -139,7 +149,5 @@ echo
 echo "Crea tu cuenta con:"
 echo "  sudo calendar-cli createuser TUUSUARIO"
 echo
-echo "Ahora sólo es accesible desde la propia máquina y sin cifrar. Para exponerlo"
-echo "(con un nombre distinto del de Drive si comparten el puerto 443):"
-echo "  sudo bash $APP_DIR/deploy/setup-tls.sh letsencrypt calendar.tudominio tu@correo 443"
-echo "  sudo bash $APP_DIR/deploy/setup-tls.sh self-signed 192.168.1.20 4123"
+echo "Calendar escucha en http://$TS_IP:$PUERTO, sólo por Tailscale (no está expuesto a Internet ni a la LAN)."
+echo "En el cliente de escritorio, la dirección del servidor es esa."

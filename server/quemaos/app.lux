@@ -16,7 +16,7 @@
 #
 # Variables: CALENDAR_DB (la misma base del servidor; sólo se hacen SELECT), CALENDAR_URL (dónde
 # escucha el servidor, para comprobar que responde), CALENDAR_QUEMAOS_PORT (9705) y
-# CALENDAR_QUEMAOS_HOST (127.0.0.1; 0.0.0.0 si QuemaOS la consulta desde otra máquina).
+# CALENDAR_QUEMAOS_HOST (127.0.0.1: QuemaOS sólo consulta el bucle local).
 
 import sqlite
 import http

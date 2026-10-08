@@ -14,7 +14,7 @@ fn bool is_loopback(string ip):
 # último elemento (el que añadió él), no los anteriores, que escribe el cliente.
 fn string client_ip():
     string peer = request.ip
-    if not is_loopback(peer) or os.getenv("CALENDAR_PROXY", "1") != "1":
+    if not is_loopback(peer) or os.getenv("CALENDAR_PROXY", "0") != "1":
         return peer
     string fwd = header("X-Forwarded-For", "")
     if fwd == "":
