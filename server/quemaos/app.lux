@@ -1,0 +1,151 @@
+# Calendar — sonda de estado para QuemaOS.
+#
+#   CALENDAR_DB=/var/lib/calendar/calendar.db lux --no-watch ./quemaos
+#
+# Contrato (el mismo que el de Homeflix y Drive):
+#
+#   GET /quemaos/status -> {"quemaos": 1, "id": "calendar", "name": "Calendar",
+#                           "status": "ok"|"warn"|"error", "message": "...",
+#                           "metrics": {...}, "extra": {...}}
+#
+# Es un PROCESO APARTE del servidor (calendar.service) a propósito: Lux sólo abre un
+# puerto por app, y la sonda tiene que ir en el suyo (rango 9700-9799 de la suite) para
+# que un servidor saturado de tráfico real no la deje en cola y dé un falso «caído».
+# La petición no toca la base de datos ni el disco: contesta con lo último que midió el
+# reloj de abajo (cada 30 s), y si el reloj se para la propia sonda lo delata.
+#
+# Variables: CALENDAR_DB (la misma base del servidor; sólo se hacen SELECT), CALENDAR_URL (dónde
+# escucha el servidor, para comprobar que responde), CALENDAR_QUEMAOS_PORT (9702) y
+# CALENDAR_QUEMAOS_HOST (127.0.0.1; 0.0.0.0 si QuemaOS la consulta desde otra máquina).
+
+import sqlite
+import http
+import os
+import time
+import json
+
+app:
+    name   "Calendar (sonda QuemaOS)"
+    port   env("CALENDAR_QUEMAOS_PORT", "9702")
+    host   env("CALENDAR_QUEMAOS_HOST", "127.0.0.1")
+    max_body "1KB"
+
+    log:
+        level "info"
+        access false
+
+    sqlite:
+        file env("CALENDAR_DB")
+        pool 1
+
+fn string server_url():
+    return os.getenv("CALENDAR_URL", "http://127.0.0.1:8100")
+
+fn string human(long n):
+    if n < 1024:
+        return str(n) + " B"
+    if n < 1048576:
+        return str(int(n / 1024)) + " KB"
+    if n < 1073741824:
+        return str(int(n / 1048576)) + " MB"
+    return str(int(n / 1073741824)) + " GB"
+
+fn Json count(string sql):
+    List<Json> rows = await sqlite.query(sql)
+    return rows[0]["n"]
+
+# Mide y deja el resultado en `state`. Es lo único que toca la base, el disco y la red.
+fn bool measure():
+    Json metrics = {}
+    Json extra = {}
+    string status = "ok"
+    string message = ""
+    try:
+        # Sólo SELECT: el driver de Lux no tiene modo de sólo lectura (reparte las conexiones),
+        # así que esta garantía es de este fichero, no de la base.
+        metrics["usuarios"] = await count("select count(*) as n from users where is_active = 1")
+        metrics["calendarios"] = await count("select count(*) as n from calendars where deleted_at is null")
+        metrics["eventos"] = await count("select count(*) as n from events where deleted_at is null")
+        metrics["series"] = await count("select count(*) as n from events where deleted_at is null and rrule <> ''")
+        metrics["sesiones"] = await count("select count(*) as n from api_tokens where revoked = 0")
+        List<Json> last = await sqlite.query("select max(last_login_at) as t from users")
+        extra["ultimo_login"] = last[0]["t"] == null ? "nunca" : time.format_iso(last[0]["t"])
+        List<Json> ver = await sqlite.query("select version from schema_version")
+        extra["esquema"] = len(ver) == 0 ? 0 : ver[0]["version"]
+    catch e:
+        state.set("probe", { "status": "error", "message": "La base de datos no responde: " + e.message, "metrics": metrics, "extra": extra, "at": time.now() })
+        return false
+
+    # ¿Responde el servidor? (healthz no toca nada pesado)
+    bool up = false
+    string why = ""
+    try:
+        Json r = await http.get(server_url() + "/healthz", {}, { "timeout_ms": 2000 })
+        up = r["status"] == 200
+        why = "respondió " + str(r["status"])
+    catch e:
+        why = e.message
+    metrics["servidor_activo"] = up ? 1 : 0
+
+    string dbfile = os.getenv("CALENDAR_DB", "")
+    if dbfile != "" and os.is_file(dbfile):
+        Json du = os.disk_usage(os.path_dirname(dbfile))
+        long free_pct = du["total"] > 0 ? int(du["free"] * 1000 / du["total"]) : 0
+        metrics["disco_libre_pct"] = free_pct / 10.0
+        extra["disco_libre"] = human(du["free"]) + " de " + human(du["total"])
+        extra["base_de_datos"] = human(os.file_size(dbfile))
+        if free_pct < 30:
+            status = "error"
+            message = "Disco casi lleno: " + str(free_pct / 10.0) + " % libre"
+        else if free_pct < 100:
+            status = "warn"
+            message = "Poco espacio en disco: " + str(free_pct / 10.0) + " % libre"
+    if not up:
+        status = "error"
+        message = "El servidor de Calendar no responde (" + why + ")"
+    if message == "":
+        message = str(metrics["usuarios"]) + " usuarios · " + str(metrics["calendarios"]) + " calendarios · " + str(metrics["eventos"]) + " eventos"
+    state.set("probe", { "status": status, "message": message, "metrics": metrics, "extra": extra, "at": time.now() })
+    return true
+
+# El rango 9700-9799 lo impone el lanzador (deploy/quemaos-run.sh): una app Lux no puede
+# salir desde `on start:`. Si aun así arranca fuera de rango, la sonda lo dice en su estado.
+fn bool port_ok():
+    int port = int(os.getenv("CALENDAR_QUEMAOS_PORT", "9702"))
+    return port >= 9700 and port <= 9799
+
+on start:
+    state.set("probe", { "status": "warn", "message": "Arrancando: aún sin medidas", "metrics": {}, "extra": {}, "at": 0 })
+    if port_ok():
+        await measure()
+    else:
+        state.set("probe", { "status": "error", "message": "CALENDAR_QUEMAOS_PORT está fuera del rango 9700-9799 de la suite", "metrics": {}, "extra": {}, "at": 0 })
+
+every "30s":
+    try:
+        if port_ok():
+            await measure()
+    catch e:
+        log.error("sonda: fallo al medir: " + e.message)
+
+get endpoint("/quemaos/status"):
+    Json d = state.get("probe", { "status": "warn", "message": "sin medidas", "metrics": {}, "extra": {}, "at": 0 })
+    string status = d["status"]
+    string message = d["message"]
+    if d["at"] > 0:
+        long age = time.now() - d["at"]
+        if age > 300000:
+            status = "error"
+            message = "Sin medidas desde hace " + str(int(age / 60000)) + " min: el reloj de medida se ha parado"
+        else if age > 90000 and status == "ok":
+            status = "warn"
+            message = "Medidas desactualizadas (hace " + str(int(age / 1000)) + " s)"
+    return {
+        "quemaos": 1,
+        "id": "calendar",
+        "name": "Calendar",
+        "status": status,
+        "message": message,
+        "metrics": d["metrics"],
+        "extra": d["extra"]
+    }

@@ -87,7 +87,7 @@ REPO="$(dirname "$RAIZ")"
 cd "$RAIZ"
 [[ -z "$LUX_BIN" ]] && LUX_BIN="$REPO/build/vendor/lux/lux"
 
-for necesario in app/app.lux deploy/install.sh; do
+for necesario in app/app.lux quemaos/app.lux deploy/install.sh; do
     if [[ ! -e "$necesario" ]]; then
         rojo "No parece la raíz del proyecto: falta $necesario"
         exit 1
@@ -183,7 +183,7 @@ cp "$LUX_BIN" "$TMP_LOCAL/lux"
 tar czf "$PAQUETE" \
     --exclude='data' \
     --exclude='tests' \
-    app deploy \
+    app quemaos deploy \
     -C "$TMP_LOCAL" lux
 gris "    $(du -h "$PAQUETE" | cut -f1)"
 

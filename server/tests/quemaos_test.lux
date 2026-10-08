@@ -1,0 +1,63 @@
+# Pruebas de la sonda de QuemaOS (server/quemaos) contra un servidor de Calendar de verdad.
+# Las lanza quemaos.sh en dos fases: con el servidor activo ("activo:") y ya parado ("caido:").
+
+import test
+
+fn string url(string path):
+    return test.base_url() + path
+
+fn Json status_body():
+    return (await http.get(url("/quemaos/status")))["body"]
+
+test "activo: cumple el contrato":
+    await measure()
+    Json r = await http.get(url("/quemaos/status"))
+    test.eq(r["status"], 200)
+    Json b = r["body"]
+    test.eq(b["quemaos"], 1)
+    test.eq(b["id"], "calendar")
+    test.eq(b["name"], "Calendar")
+    test.eq(b["status"], "ok")
+    test.ok(len(str(b["message"])) > 3)
+    test.ok(b["metrics"].has("usuarios") and b["metrics"].has("eventos") and b["metrics"].has("disco_libre_pct"))
+    test.eq(b["metrics"]["servidor_activo"], 1)
+    test.eq((await http.get(url("/quemaos/status/")))["status"], 200)
+    test.eq((await http.get(url("/otra-cosa")))["status"], 404)
+
+test "activo: las métricas salen de la base y se refrescan al medir":
+    Json before = await status_body()
+    test.eq(before["metrics"]["eventos"], 0)
+    # Se escribe en la base por el camino del servidor.
+    string token = os.getenv("CALENDAR_TEST_TOKEN", "")
+    Json ops = await http.post(os.getenv("CALENDAR_URL", "") + "/api/ops", { "ops": [
+        { "op": "cal.put", "key": "1", "id": "cal-quemaos-1", "name": "A", "color": "#d97757" },
+        { "op": "event.put", "key": "2", "id": "ev-quemaos-01", "calendar_id": "cal-quemaos-1", "title": "X", "start": 1800000000000, "end": 1800003600000, "tzid": "UTC", "rrule": "FREQ=DAILY" }
+    ] }, { "Authorization": "Bearer " + token })
+    test.eq(ops["status"], 200)
+    # La petición no mide: sigue la caché hasta que el reloj (o este test) mida.
+    test.eq((await status_body())["metrics"]["eventos"], 0)
+    await measure()
+    Json after = await status_body()
+    test.eq(after["metrics"]["eventos"], 1)
+    test.eq(after["metrics"]["series"], 1)
+    test.eq(after["metrics"]["calendarios"], 1)
+    test.contains(after["message"], "1 eventos")
+
+test "activo: medidas viejas avisan y luego dan error":
+    await measure()
+    Json d = state.get("probe", {})
+    d["at"] = time.now() - 100000
+    state.set("probe", d)
+    test.eq((await status_body())["status"], "warn")
+    d["at"] = time.now() - 400000
+    state.set("probe", d)
+    Json b = await status_body()
+    test.eq(b["status"], "error")
+    test.contains(b["message"], "reloj de medida")
+
+test "caido: si el servidor no responde, error":
+    await measure()
+    Json b = await status_body()
+    test.eq(b["status"], "error")
+    test.contains(b["message"], "no responde")
+    test.eq(b["metrics"]["servidor_activo"], 0)

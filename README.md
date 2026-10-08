@@ -55,6 +55,10 @@ ssh usuario@servidor sudo bash /opt/calendar/deploy/setup-tls.sh letsencrypt cal
 
 Variables en `/etc/calendar/calendar.env`: `CALENDAR_DB`, `BIND_PORT`, `CALENDAR_HOST` (127.0.0.1), `CALENDAR_PROXY` (1 si hay nginx delante).
 
+## Estado para QuemaOS
+
+`calendar-quemaos.service` es un proceso aparte (Lux sólo abre un puerto por app) que escucha en `127.0.0.1:9702` y responde `GET /quemaos/status` con el contrato de la suite: `{quemaos, id: "calendar", name, status: ok|warn|error, message, metrics, extra}`. No toca la base al contestar: sirve lo último que midió un reloj interno (cada 30 s) y, si ese reloj se para, lo delata. Da `error` si el servidor no responde a `/healthz` o queda poco disco, y `warn` si va justo. El puerto va en `calendar.env` (`CALENDAR_QUEMAOS_PORT`, 9700-9799 — lo impone `quemaos-run.sh`) y `CALENDAR_QUEMAOS_HOST=0.0.0.0` la abre a la red. Código: [server/quemaos/app.lux](server/quemaos/app.lux). Sólo hace `SELECT`, pero el driver SQLite de Lux no tiene modo de sólo lectura, así que esa garantía es del código, no de la base.
+
 ## Escritorio
 
 ```bash
@@ -92,6 +96,7 @@ Lux no trae RRULE, así que se añadió un módulo nativo ([rrule.cpp](vendor/lu
 ```
 
 - `node desktop/tests/logic.test.js`: fechas, repeticiones del formulario y maquetación de la ventana.
+- `server/tests/quemaos.sh`: la sonda de QuemaOS (contrato, métricas, caché, servidor caído, rango de puertos).
 - `server/tests/run.sh`: el módulo `rrule` (18 casos: cambio de hora, hora inexistente y ambigua, el 31, años bisiestos…) y la API contra un servidor real (17: aislamiento entre cuentas, idempotencia, conflictos, paginación, purga de lápidas, ámbitos, bloqueo…).
 - `desktop/tests/e2e.sh`: el servicio contra un servidor real (12: sin conexión, conflictos por fecha de edición, rechazos del servidor, series, avisos, lotes grandes…).
 - `desktop/tests/dev.sh`: servidor + servicio + ventana con datos de ejemplo para desarrollar.
@@ -100,6 +105,7 @@ Lux no trae RRULE, así que se añadió un módulo nativo ([rrule.cpp](vendor/lu
 
 ```
 vendor/lux/                      Lux (copia de la de Drive de escritorio) + módulo rrule
+server/quemaos/                  la sonda de QuemaOS (app Lux aparte)
 server/app/                      app.lux · lib/{db,auth,calendar,maintenance}.lux · routes/{api,commands}.lux
 server/deploy/                   install · remote-update (con vuelta atrás) · deploy · calendar-cli · nginx · setup-tls
 desktop/daemon/                  store · remote · data · sync · reminders · api

@@ -1,0 +1,37 @@
+[Unit]
+Description=Calendar — sonda de estado para QuemaOS
+After=calendar.service
+# Se reinicia y se para con el servidor, pero no depende de él: si él cae, la sonda sigue y lo dice.
+PartOf=calendar.service
+
+[Service]
+Type=exec
+User=calendar
+Group=calendar
+WorkingDirectory=/opt/calendar
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=/etc/calendar/calendar.env
+ExecStart=/opt/calendar/quemaos-run.sh
+Restart=on-failure
+RestartSec=5
+
+# --- Endurecimiento -------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# SQLite en modo WAL necesita escribir los ficheros -shm/-wal aunque sólo se lea.
+ReadWritePaths=/var/lib/calendar
+UMask=0027
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

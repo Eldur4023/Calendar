@@ -53,11 +53,13 @@ echo "==> Copiando la aplicación a $APP_DIR"
 mkdir -p "$APP_DIR"
 # Se borra el código anterior en vez de copiar encima: si no, un fichero que
 # se haya eliminado del proyecto seguiría vivo en el servidor.
-rm -rf "$APP_DIR/app" "$APP_DIR/deploy"
+rm -rf "$APP_DIR/app" "$APP_DIR/deploy" "$APP_DIR/quemaos"
 cp -r "$SOURCE_DIR/app" "$APP_DIR/app"
+cp -r "$SOURCE_DIR/quemaos" "$APP_DIR/quemaos"
 install -m 755 "$LUX_SRC_BIN" "$APP_DIR/lux"
 cp "$SOURCE_DIR/deploy/run.sh" "$APP_DIR/run.sh"
-chmod 755 "$APP_DIR/run.sh"
+cp "$SOURCE_DIR/deploy/quemaos-run.sh" "$APP_DIR/quemaos-run.sh"
+chmod 755 "$APP_DIR/run.sh" "$APP_DIR/quemaos-run.sh"
 # Los scripts de operación quedan en el servidor: setup-tls.sh y la plantilla de
 # nginx hacen falta después de instalar, no sólo durante.
 cp -r "$SOURCE_DIR/deploy" "$APP_DIR/deploy"
@@ -65,6 +67,7 @@ rm -f "$APP_DIR/deploy/lux"
 
 echo "==> Comprobando que la aplicación compila con este Lux"
 CALENDAR_DB=/dev/null "$APP_DIR/lux" --check "$APP_DIR/app" >/dev/null
+CALENDAR_DB=/dev/null "$APP_DIR/lux" --check "$APP_DIR/quemaos" >/dev/null
 
 echo "==> Preparando los directorios de datos"
 mkdir -p "$DATA_DIR" "$ENV_DIR"
@@ -80,6 +83,10 @@ CALENDAR_DB=$DATA_DIR/calendar.db
 # (deploy/setup-tls.sh). Con nginx delante déjalo en 1: se fía de X-Forwarded-For.
 BIND_PORT=8100
 CALENDAR_PROXY=1
+
+# Sonda de estado para QuemaOS: su propio puerto, del rango 9700-9799 de la suite. Escucha sólo en
+# 127.0.0.1; pon CALENDAR_QUEMAOS_HOST=0.0.0.0 si QuemaOS la consulta desde otra máquina.
+CALENDAR_QUEMAOS_PORT=9702
 ENV
     chmod 640 "$ENV_DIR/calendar.env"
     chown root:"$SERVICE_USER" "$ENV_DIR/calendar.env"
@@ -95,8 +102,9 @@ echo "==> Instalando el servicio"
 cp "$SOURCE_DIR/deploy/calendar.service" /etc/systemd/system/calendar.service
 cp "$SOURCE_DIR/deploy/calendar-cli.sh" /usr/local/bin/calendar-cli
 chmod 755 /usr/local/bin/calendar-cli
+cp "$SOURCE_DIR/deploy/calendar-quemaos.service" /etc/systemd/system/calendar-quemaos.service
 systemctl daemon-reload
-systemctl enable calendar.service
+systemctl enable calendar.service calendar-quemaos.service
 systemctl restart calendar.service
 
 PUERTO="$(grep -E '^BIND_PORT=' "$ENV_DIR/calendar.env" | cut -d= -f2)"
@@ -109,7 +117,17 @@ for _ in $(seq 1 20); do
     sleep 1
 done
 
+systemctl restart calendar-quemaos.service
+QPORT="$(grep -E '^CALENDAR_QUEMAOS_PORT=' "$ENV_DIR/calendar.env" | cut -d= -f2)"
+QPORT="${QPORT:-9702}"
+sleep 2
+
 echo
+if curl -fsS --max-time 3 "http://127.0.0.1:$QPORT/quemaos/status" >/dev/null 2>&1; then
+    echo "Sonda de QuemaOS en http://127.0.0.1:$QPORT/quemaos/status"
+else
+    echo "aviso: la sonda de QuemaOS no responde (journalctl -u calendar-quemaos)" >&2
+fi
 if curl -fsS --max-time 3 "http://127.0.0.1:$PUERTO/healthz" >/dev/null 2>&1; then
     echo "Calendar responde en http://127.0.0.1:$PUERTO"
 else

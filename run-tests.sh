@@ -12,6 +12,8 @@ echo "== Lógica de la ventana (node)"
 node "$ROOT/desktop/tests/logic.test.js" || status=1
 echo "== Módulo rrule y servidor"
 "$ROOT/server/tests/run.sh" || status=1
+echo "== Sonda de QuemaOS"
+"$ROOT/server/tests/quemaos.sh" || status=1
 echo "== Servicio de escritorio contra un servidor real"
 "$ROOT/desktop/tests/e2e.sh" || status=1
 [ $status -eq 0 ] && echo "TODO CORRECTO" || echo "HAY FALLOS"
