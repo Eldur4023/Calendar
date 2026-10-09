@@ -24,8 +24,7 @@
 PORT=${LUX_TEST_PG_PORT:-8810}
 source "$(dirname "$0")/lib.sh"
 
-# La URL (con usuario y contraseña de la base de pruebas) la pone quien lanza las pruebas.
-PGURL="${LUX_TEST_PGURL:?define LUX_TEST_PGURL=postgresql://USUARIO:CLAVE@127.0.0.1/lux_tests}"
+PGURL="postgresql://lux:lux@127.0.0.1/lux_tests"
 
 # ─── Can it run? ─────────────────────────────────────────────────────────────
 

@@ -16,6 +16,7 @@
 #include <lux/app.hpp>
 #include <lux/middleware.hpp>
 #include <lux/logger.hpp>
+#include <lux/tls.hpp>
 #include <lux/openapi.hpp>
 
 #include <atomic>
@@ -338,7 +339,7 @@ static void run_tests(const lux_script::Module& m, lux::DispatchFn dispatch, std
     std::_Exit(g_test_rc.load());
 }
 
-// Drive Sync (desktop/): the desktop shell links this file with LUX_EMBEDDED and
+// Desktop apps (Drive Sync, Calendar, Mail): their shell links this file with LUX_EMBEDDED and
 // calls lux_main() on a thread, so it serves the app exactly as `lux` does
 // (every:, on start:, limits...) instead of keeping a second copy of this wiring.
 #ifdef LUX_EMBEDDED
@@ -470,6 +471,7 @@ int main(int argc, char** argv) {
     publish_module(mod);
 
     const lux_script::AppDecl& cfg = mod->program.app;
+    const lux_script::TlsDecl& tls = mod->program.tls;
     lux::App app;
     // One line per request, with its flush, costs close to 25% of the
     // throughput and multiplies median latency by 2.6: it is opt-in.
@@ -632,6 +634,13 @@ int main(int argc, char** argv) {
         }).detach();
     }
 
+    if (!test_mode && tls.present) {
+        std::string tls_err = "tls: needs both cert and key for HTTPS";
+        if (tls.cert.empty() || tls.key.empty() || !lux::tls::init(tls.cert, tls.key, tls_err)) {
+            std::cerr << "https: " << tls_err << "\n";
+            return 1;
+        }
+    }
     lux::http::g_max_body_size = cfg.max_body;
     lux::global_headers() = cfg.headers;
     app.run(test_mode ? std::string("127.0.0.1") : cfg.host, port_override ? static_cast<uint16_t>(port_override)

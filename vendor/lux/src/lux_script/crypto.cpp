@@ -400,7 +400,7 @@ std::string random_bytes(size_t n) {
         // free correctness). Available unconditionally: this project only
         // targets Linux, and getrandom() has existed since Linux 3.17
         // (2014)/glibc 2.25.
-        // syscall, not ::getrandom(): bionic only declares it from API 28 (Android build targets 28 anyway).
+        // syscall, not ::getrandom(): bionic only declares it from API 28 (the Android build targets 28 anyway).
         ssize_t r = ::syscall(SYS_getrandom, out.data() + got, n - got, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
