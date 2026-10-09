@@ -24,7 +24,7 @@
     set(k, v) { try { localStorage.setItem("cal." + k, JSON.stringify(v)); } catch (e) { /* sin almacenamiento: no pasa nada */ } },
   };
   const S = {
-    view: store.get("view", "month"), date: new Date(), cals: [], occ: [], items: [], byKey: {}, hidden: store.get("hidden", {}),
+    view: store.get("view", matchMedia("(max-width:860px)").matches ? "agenda" : "month"), date: new Date(), cals: [], occ: [], items: [], byKey: {}, hidden: store.get("hidden", {}),
     status: null, sel: null, loadSeq: 0, scrollTo: true, edit: null, lastCal: store.get("lastCal", ""),
     alertSince: Date.now(), alertMax: 0, creatingDefault: false, syncing: false,
   };
@@ -33,8 +33,16 @@
   function uuid() { return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)).replace(/-/g, ""); }
   function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
+  // Android: la actividad abre la página con #t=<secreto de la API local> (otras apps del teléfono pueden abrir el puerto).
+  const TOKEN = (() => {
+    const m = /[#&]t=([^&]+)/.exec(location.hash);
+    try { if (m) { sessionStorage.setItem("calTok", m[1]); history.replaceState(null, "", location.pathname + location.search); } return sessionStorage.getItem("calTok") || ""; }
+    catch (e) { return m ? m[1] : ""; }
+  })();
+
   function api(method, path, body) {
     const opt = { method: method, headers: {} };
+    if (TOKEN) opt.headers["X-Calendar-Token"] = TOKEN;
     if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
     return fetch(path, opt).then(
       (r) => r.text().then((t) => { let b = null; try { b = t ? JSON.parse(t) : null; } catch (e) { b = { detail: t }; } return { ok: r.ok, status: r.status, body: b }; }),
@@ -80,6 +88,7 @@
     const configured = !!(st && st.configured);
     $("onboarding").hidden = configured || !st;
     $("layout").hidden = !configured;
+    $("fab").hidden = !configured;
     for (const id of ["nav", "views", "btn-sync", "btn-search", "btn-log"]) $(id).hidden = !configured;
     document.querySelectorAll("#views button").forEach((b) => b.classList.toggle("on", b.dataset.view === S.view));
     renderConn();
@@ -265,6 +274,31 @@
     if (t.dataset.cal) { S.hidden[t.dataset.cal] = !S.hidden[t.dataset.cal]; store.set("hidden", S.hidden); render(); }
   });
   $("btn-new").onclick = () => openEditor(null, defaultStart());
+  // móvil: botón flotante, cajón de calendarios y "atrás" (el Activity de Android llama a luxBack)
+  const drawer = (on) => $("layout").classList.toggle("drawer", on);
+  $("fab").onclick = () => $("btn-new").click();
+  $("btn-menu").onclick = () => drawer(true);
+  $("layout").addEventListener("click", (e) => { if (e.target === $("layout")) drawer(false); });
+  window.luxBack = () => {
+    const dlg = document.querySelector("dialog[open]");
+    if (dlg) { dlg.close(); return true; }
+    if ($("layout").classList.contains("drawer")) { drawer(false); return true; }
+    return false;
+  };
+  let swipe = null;
+  document.addEventListener("touchstart", (e) => {
+    const t = e.touches[0];
+    swipe = e.touches.length === 1 && !e.target.closest("input, textarea, select, dialog[open]") ? { x: t.clientX, y: t.clientY } : null;
+  }, { passive: true });
+  document.addEventListener("touchend", (e) => {
+    if (!swipe) return;
+    const t = e.changedTouches[0], dx = t.clientX - swipe.x, dy = t.clientY - swipe.y, open = $("layout").classList.contains("drawer");
+    if (Math.abs(dx) > 70 && Math.abs(dy) < Math.abs(dx) * 0.5 && matchMedia("(max-width:860px)").matches && !$("layout").hidden) {
+      if (dx > 0 && !open && swipe.x < innerWidth * 0.6) drawer(true);
+      else if (dx < 0 && open) drawer(false);
+    }
+    swipe = null;
+  }, { passive: true });
   $("btn-newcal").onclick = () => openCal(null);
 
   $("stage").addEventListener("click", (e) => {

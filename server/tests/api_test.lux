@@ -315,3 +315,62 @@ test "cuenta desactivada no entra con su token":
     test.eq((await get("/api/me", t))["status"], 401)
     Json login = await post("/api/login", { "username": "quique", "password": pw() }, "")
     test.eq(login["status"], 401)
+
+# ── API sencilla para crear cosas ───────────────────────────────────────────
+
+test "crear un evento con una hora de pared: va en la zona indicada, con DST":
+    string t = await account("rest1")
+    # 12-oct-2026 es horario de verano en Madrid (UTC+2): 10:00 allí son las 08:00 UTC.
+    Json r = await post("/api/events", { "title": "Dentista", "start": "2026-10-12T10:00" }, t)
+    test.eq(r["status"], 201, "crea")
+    Json e = r["body"]["event"]
+    test.eq(e["start"], time.parse_iso("2026-10-12T08:00:00Z"), "10:00 en Madrid")
+    test.eq(e["end"], e["start"] + 3600000, "una hora por defecto")
+    test.eq(e["tzid"], "Europe/Madrid", "zona por defecto")
+    test.eq(e["all_day"], false)
+    # En invierno son UTC+1: 10:00 son las 09:00 UTC.
+    Json w = await post("/api/events", { "title": "Invierno", "start": "2026-12-14 10:00", "tzid": "Europe/Madrid" }, t)
+    test.eq(w["body"]["event"]["start"], time.parse_iso("2026-12-14T09:00:00Z"), "10:00 en diciembre")
+    # Sin calendario indicado se crea «Personal» y se usa.
+    Json cals = await get("/api/calendars", t)
+    test.eq(len(cals["body"]["calendars"]), 1)
+    test.eq(cals["body"]["calendars"][0]["name"], "Personal")
+    # Lo ve cualquier cliente por /api/changes
+    Json ch = await get("/api/changes?since=0", t)
+    test.eq(len(ch["body"]["events"]), 2, "aparece para la sincronización")
+
+test "crear un evento con zona explícita, calendario por nombre, avisos y repetición":
+    string t = await account("rest2")
+    Json c = await post("/api/calendars", { "name": "Trabajo", "color": "#1d4ed8" }, t)
+    test.eq(c["status"], 201)
+    Json r = await post("/api/events", { "title": "Reunión", "start": "2026-10-12T10:00:00+02:00", "end": "2026-10-12T08:45:00Z",
+        "calendar": "trabajo", "reminders": [0, 10], "rrule": "FREQ=WEEKLY;BYDAY=MO", "location": "Sala 2" }, t)
+    test.eq(r["status"], 201, "crea")
+    Json e = r["body"]["event"]
+    test.eq(e["calendar_id"], c["body"]["calendar"]["id"], "por nombre, sin mayúsculas")
+    test.eq(e["end"] - e["start"], 2700000, "45 minutos")
+    test.eq(e["reminders"], [0, 10])
+    test.eq(e["rrule"], "FREQ=WEEKLY;BYDAY=MO")
+
+test "crear un evento de todo el día: la fecha de fin es inclusive":
+    string t = await account("rest3")
+    Json one = await post("/api/events", { "title": "Festivo", "start": "2026-10-12" }, t)
+    test.eq(one["status"], 201)
+    test.eq(one["body"]["event"]["all_day"], true)
+    test.eq(one["body"]["event"]["start"], time.parse_iso("2026-10-12T00:00:00Z"))
+    test.eq(one["body"]["event"]["end"], time.parse_iso("2026-10-13T00:00:00Z"), "un día")
+    Json three = await post("/api/events", { "title": "Viaje", "start": "2026-10-12", "end": "2026-10-14" }, t)
+    test.eq(three["body"]["event"]["end"], time.parse_iso("2026-10-15T00:00:00Z"), "12, 13 y 14")
+
+test "crear un evento: errores claros y permisos":
+    string t = await account("rest4")
+    test.eq((await post("/api/events", { "title": "Sin fecha" }, t))["status"], 400, "falta start")
+    test.eq((await post("/api/events", { "start": "2026-10-12T10:00" }, t))["status"], 400, "falta title")
+    test.eq((await post("/api/events", { "title": "x", "start": "mañana" }, t))["status"], 400, "fecha incomprensible")
+    test.eq((await post("/api/events", { "title": "x", "start": "2026-10-12T10:00", "tzid": "Marte/Olimpo" }, t))["status"], 400, "zona")
+    test.eq((await post("/api/events", { "title": "x", "start": "2026-10-12T10:00", "calendar": "no existe" }, t))["status"], 400, "calendario")
+    test.eq((await post("/api/events", { "title": "x", "start": "2026-10-12T10:00", "end": "2026-10-12T09:00" }, t))["status"], 400, "acaba antes de empezar")
+    test.eq((await post("/api/events", { "title": "x", "start": "2026-10-12T10:00" }, ""))["status"], 401, "sin token")
+    string ro = await token_with("rest4", ["read"])
+    test.eq((await post("/api/events", { "title": "x", "start": "2026-10-12T10:00" }, ro))["status"], 403, "token de solo lectura")
+    test.eq((await get("/api/calendars", ro))["status"], 200, "pero puede listar")

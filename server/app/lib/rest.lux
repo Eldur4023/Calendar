@@ -1,0 +1,54 @@
+# API REST sencilla para crear cosas (POST /api/events, POST /api/calendars): lo mismo que
+# /api/ops, pero sin ids propios, sin claves de operación y con fechas ISO en vez de
+# milisegundos. Toda la validación y el guardado pasan por put_event / put_calendar.
+
+# Zona de las horas que llegan sin zona ("2026-10-12T10:00"): la del cuerpo (`tzid`) o, si falta, esta.
+fn string default_tz():
+    return os.getenv("CALENDAR_DEFAULT_TZ", "Europe/Madrid")
+
+# Lo que marca el reloj de pared en `tz` a la vez que `ms` (UTC), menos `ms`: el desfase de esa zona en ese instante.
+fn long tz_offset_ms(long ms, string tz):
+    long t = ms - ms % 1000
+    string wall = time.format(t, "%Y-%m-%dT%H:%M:%S", tz)
+    return time.parse_iso(wall) - t
+
+# El instante UTC de una hora de pared en `tz` (dos pasadas: el desfase puede cambiar con el horario).
+fn long wall_to_utc(long wall, string tz):
+    long utc = wall - tz_offset_ms(wall, tz)
+    return wall - tz_offset_ms(utc, tz)
+
+# Un instante de la petición: milisegundos UTC (entero), "AAAA-MM-DD" (día), una hora con zona
+# ("2026-10-12T08:00:00Z", "...:00+02:00", con segundos) u hora de pared sin zona ("2026-10-12T10:00[:00]"), que va en `tz`.
+# Devuelve {"ms", "date_only"} o null si no se entiende.
+fn Json parse_when(Json v, string tz):
+    if v == null:
+        return null
+    if is_whole(v):
+        return { "ms": int(v), "date_only": false }
+    string s = str(v).trim()
+    if regex.test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", s):
+        long d = time.parse_iso(s)
+        return d == null ? null : { "ms": d, "date_only": true }
+    if regex.test("^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$", s):
+        long z = time.parse_iso(s)
+        return z == null ? null : { "ms": z, "date_only": false }
+    if regex.test("^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\\.[0-9]+)?)?$", s):
+        if regex.test("[T ][0-9]{2}:[0-9]{2}$", s):
+            s = s + ":00"
+        long w = time.parse_iso(s)
+        return w == null ? null : { "ms": wall_to_utc(w, tz), "date_only": false }
+    return null
+
+# El calendario por id o por nombre (sin distinguir mayúsculas); sin indicar, el primero (se crea «Personal» si no hay ninguno).
+fn string resolve_calendar(string uid, string wanted):
+    List<Json> cals = await sqlite.query("select id, name from calendars where user_id = ? and deleted_at is null order by position, name", uid)
+    if wanted != "":
+        for Json c in cals:
+            if c["id"] == wanted or c["name"].lower() == wanted.lower():
+                return c["id"]
+        return ""
+    if len(cals) > 0:
+        return cals[0]["id"]
+    string id = new_id()
+    Json r = await put_calendar(uid, { "key": "api", "id": id, "name": "Personal" })
+    return r["ok"] ? id : ""

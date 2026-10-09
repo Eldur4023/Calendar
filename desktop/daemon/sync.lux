@@ -213,9 +213,10 @@ fn Json sync_once():
         state.set("backoff_until", time.now() + 30000)
     return result
 
-# El ritmo lo marca un reloj corto: sincroniza si hay cambios locales por enviar
-# (`sync_now`) o si toca el sondeo (cada minuto), y lanza los avisos que toquen.
-every "5s":
+# Una pasada del reloj: sincroniza si hay cambios locales por enviar (`sync_now`) o si toca el sondeo
+# (cada minuto), y lanza los avisos que toquen. La llama el reloj corto de abajo y, en Android, la
+# alarma que despierta el móvil (POST /api/tick): allí el proceso duerme y el reloj no basta.
+fn bool tick():
     try:
         if await configured():
             long last = int(await setting("last_attempt", "0"))
@@ -228,3 +229,7 @@ every "5s":
             await check_reminders()
     catch e:
         log.error("fallo en la tarea periódica: " + e.message)
+    return true
+
+every "5s":
+    await tick()

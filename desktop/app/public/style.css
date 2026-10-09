@@ -222,7 +222,29 @@ kbd { background:var(--surface-3); border:1px solid var(--border-strong); border
 .toast.error { border-left-color:var(--err); }
 @keyframes rise { from { transform:translateY(8px); opacity:0; } }
 
+/* ── móvil (APK) ─────────────────────────────────────────────────────────── */
+.menu-only, .fab { display:none; }
 @media (max-width: 860px) {
-  .layout { grid-template-columns:1fr; } .side { display:none; }
-  .brand b, .conn span { display:none; } .brand { min-width:0; }
+  .menu-only { display:inline-flex; }
+  /* dos filas: menú + fecha + sincronizar/ajustes, y debajo las vistas */
+  .top { flex-wrap:wrap; gap:4px 6px; padding:8px 10px; padding-top:calc(8px + env(safe-area-inset-top)); }
+  .brand { display:none; }
+  .nav { flex:1; min-width:0; } .nav h1 { font-size:16px; margin-left:4px; overflow:hidden; text-overflow:ellipsis; }
+  .actions { display:contents; }
+  #views { order:10; flex-basis:100%; display:flex; } #views button { flex:1; padding:6px 4px; }
+  .conn span, #btn-log, #btn-search { display:none; }
+  .layout { grid-template-columns:minmax(0,1fr); position:relative; }
+  /* las carpetas (calendarios) son un cajón: ☰ o deslizar a la derecha */
+  .side { display:block; position:fixed; z-index:30; top:0; bottom:0; left:0; width:min(300px,82vw); padding-top:calc(16px + env(safe-area-inset-top));
+    background:var(--surface); transform:translateX(-102%); transition:transform .2s; }
+  .layout.drawer .side { transform:none; box-shadow:0 0 30px rgba(0,0,0,.6); }
+  .layout.drawer::after { content:""; position:fixed; inset:0; z-index:25; background:rgba(0,0,0,.5); }
+  .layout.drawer .side { z-index:30; }
+  .fab { display:inline-flex; position:fixed; z-index:20; right:16px; bottom:calc(16px + env(safe-area-inset-bottom)); width:56px; height:56px; padding:0; border-radius:50%; box-shadow:var(--shadow); }
+  .fab .ico { width:24px; height:24px; stroke-width:2.4; }
+  .fab[hidden] { display:none; }
+  button { padding:9px 14px; }
+  input, select, textarea { font-size:16px; }   /* 16px: el WebView no hace zoom al enfocar */
+  dialog, dialog.small { width:calc(100vw - 16px); max-height:calc(100% - 16px); padding:18px 16px; }
+  .toasts { left:12px; right:12px; bottom:84px; } .toast { max-width:none; }
 }

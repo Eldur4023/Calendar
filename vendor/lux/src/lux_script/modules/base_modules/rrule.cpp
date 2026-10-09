@@ -21,6 +21,7 @@
 // COUNT counts every occurrence the rule generates, EXDATEs included, as the RFC
 // says. `exdates` are UTC instants compared for equality with the generated starts.
 #include <lux_script/builtin_module.hpp>
+#include <lux_script/tz.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -163,8 +164,8 @@ int days_in_month(ch::year y, ch::month m) {
     return static_cast<int>(unsigned((ch::year_month_day_last{y, ch::month_day_last{m}}).day()));
 }
 
-const ch::time_zone* find_zone(const std::string& id) {
-    try { return ch::get_tzdb().locate_zone(id.empty() ? "UTC" : id); }
+const lux_tz::time_zone* find_zone(const std::string& id) {
+    try { return lux_tz::locate(id.empty() ? "UTC" : id); }
     catch (const std::exception&) { return nullptr; }
 }
 
@@ -173,8 +174,8 @@ const ch::time_zone* find_zone(const std::string& id) {
 // earlier of the two instances for an ambiguous one -- both what the RFC asks for --
 // and the only one there is otherwise. (to_sys() is no use here: libstdc++ does not throw
 // for a nonexistent time but returns the end of the gap.)
-long long to_utc_ms(const ch::time_zone* tz, ch::local_time<ms> lt) {
-    const ch::local_info li = tz->get_info(lt);
+long long to_utc_ms(const lux_tz::time_zone* tz, lux_tz::local_time<ms> lt) {
+    const lux_tz::local_info li = tz->get_info(lt);
     return lt.time_since_epoch().count() - ch::duration_cast<ms>(li.first.offset).count();
 }
 
@@ -221,7 +222,7 @@ Value fn_check(NativeCtx&, std::vector<Value>& a, std::string&) {
 Value fn_expand(NativeCtx&, std::vector<Value>& a, std::string& error) {
     Rule r;
     if (!parse_rule(a[0].as_str(), r, error)) return Value::null();
-    const ch::time_zone* tz = find_zone(a[2].as_str());
+    const lux_tz::time_zone* tz = find_zone(a[2].as_str());
     if (!tz) { error = "rrule.expand(): unknown time zone '" + a[2].as_str() + "'"; return Value::null(); }
     const long long start = a[1].as_int(), from = a[4].as_int(), to = a[5].as_int();
     const long long limit = a.size() > 6 ? std::clamp<long long>(a[6].as_int(), 1, 10000) : 1000;
@@ -229,7 +230,7 @@ Value fn_expand(NativeCtx&, std::vector<Value>& a, std::string& error) {
     for (const Value& v : a[3].as_list()) if (v.is_int()) ex.push_back(v.as_int());
 
     // DTSTART's wall clock in the event's zone.
-    const ch::local_time<ms> lt0 = ch::zoned_time<ms>(tz, ch::sys_time<ms>(ms(start))).get_local_time();
+    const lux_tz::local_time<ms> lt0 = lux_tz::to_local<ms>(tz, ch::sys_time<ms>(ms(start)));
     const ch::sys_days start_d{ch::floor<ch::days>(lt0).time_since_epoch()};
     const ms tod = lt0 - ch::floor<ch::days>(lt0);
     const ch::year_month_day sym{start_d};
@@ -237,14 +238,14 @@ Value fn_expand(NativeCtx&, std::vector<Value>& a, std::string& error) {
     // UNTIL as a UTC instant. A bare date is inclusive: the whole local day.
     long long until = -1;
     if (r.until_kind == Rule::Until::Utc) until = r.until_ms;
-    else if (r.until_kind == Rule::Until::Local) until = to_utc_ms(tz, ch::local_time<ms>(ms(r.until_ms)));
-    else if (r.until_kind == Rule::Until::Day) until = to_utc_ms(tz, ch::local_time<ms>(ms(r.until_ms + 86'400'000 - 1)));
+    else if (r.until_kind == Rule::Until::Local) until = to_utc_ms(tz, lux_tz::local_time<ms>(ms(r.until_ms)));
+    else if (r.until_kind == Rule::Until::Day) until = to_utc_ms(tz, lux_tz::local_time<ms>(ms(r.until_ms + 86'400'000 - 1)));
 
     Value::List out;
     long long generated = 0;
     // Returns false when generation is over.
     auto emit = [&](ch::sys_days day) -> bool {
-        const long long utc = to_utc_ms(tz, ch::local_time<ms>(day.time_since_epoch() + tod));
+        const long long utc = to_utc_ms(tz, lux_tz::local_time<ms>(day.time_since_epoch() + tod));
         if (utc < start) return true;
         if ((until >= 0 && utc > until) || utc >= to) return false;
         if (r.count > 0 && generated >= r.count) return false;

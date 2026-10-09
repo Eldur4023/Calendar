@@ -15,19 +15,6 @@ fn long effective_start(Json r, long start):
     # El mediodía UTC de la fecha cae en esa misma fecha en cualquier zona de Europa y América.
     return time.start_of(start + 43200000, "day", local_tz())
 
-fn string runtime_dir():
-    return os.getenv("CALENDAR_RUNTIME_DIR", "/run/user/" + os.getenv("CALENDAR_UID", "1000"))
-
-fn bool desktop_notify(string title, string body):
-    try:
-        Json res = await os.run(os.getenv("CALENDAR_NOTIFY_CMD", "notify-send"), ["-a", "Calendar", "-i", "calendar-desktop", "-u", "normal", "-t", "0", title, body], {
-            "timeout_ms": 5000,
-            "env": { "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + runtime_dir() + "/bus", "XDG_RUNTIME_DIR": runtime_dir() }
-        })
-        return res["status"] == 0
-    catch e:
-        return false
-
 fn string when_text(long eff, long now):
     long mins = int((eff - now + 30000) / 60000)
     if mins <= 0:

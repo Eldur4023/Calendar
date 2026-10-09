@@ -115,3 +115,69 @@ group("/api"):
                     kept.add(r)
             rows = kept
         return { "occurrences": occurrences_of(rows, after, before, 5000) }
+
+    # ── Crear cosas, sin ids ni milisegundos ────────────────────────────────
+
+    get endpoint("/calendars"):
+        Json a = await need_user("read")
+        List<Json> out = []
+        for Json c in await sqlite.query("select * from calendars where user_id = ? and deleted_at is null order by position, name", a["user"]["id"]):
+            out.add(cal_view(c))
+        return { "calendars": out }
+
+    # {"name": "Trabajo", "color": "#1d4ed8"}  (color opcional)
+    post endpoint("/calendars", Json body):
+        Json a = await need_user("write")
+        string id = new_id()
+        Json r = await put_calendar(a["user"]["id"], { "key": "api", "id": id, "name": sget(body, "name", ""), "color": sget(body, "color", "#d97757") })
+        if not r["ok"]:
+            return { "detail": r["error"] }.status(400)
+        Json row = first(await sqlite.query("select * from calendars where id = ?", id))
+        return { "calendar": cal_view(row) }.status(201)
+
+    # Crea un evento. Obligatorios: `title` y `start`. El resto es opcional:
+    #   end         como start; por defecto 1 hora después (o el mismo día, si es de todo el día)
+    #   all_day     true, o `start` solo con fecha ("2026-10-12"); en ese caso `end` es el último día, inclusive
+    #   tzid        zona de las horas sin zona y de las repeticiones (por defecto CALENDAR_DEFAULT_TZ, Europe/Madrid)
+    #   calendar    id o nombre; por defecto el primero (se crea «Personal» si no hay ninguno)
+    #   location, notes, reminders (minutos antes: [0, 10]), rrule ("FREQ=WEEKLY;BYDAY=MO")
+    # Fechas: "2026-10-12T10:00", "2026-10-12T10:00:00+02:00", "2026-10-12T08:00:00Z", "2026-10-12" o ms UTC.
+    post endpoint("/events", Json body):
+        Json a = await need_user("write")
+        string uid = a["user"]["id"]
+        string tz = sget(body, "tzid", default_tz())
+        if not valid_tz(tz):
+            return { "detail": "zona horaria desconocida: " + tz }.status(400)
+        Json start = parse_when(body.has("start") ? body["start"] : null, tz)
+        if start == null:
+            return { "detail": "start es obligatorio: \"2026-10-12T10:00\", con zona (\"...Z\", \"...+02:00\"), \"2026-10-12\" o milisegundos UTC." }.status(400)
+        Json end = null
+        if body.has("end") and body["end"] != null:
+            end = parse_when(body["end"], tz)
+            if end == null:
+                return { "detail": "end no se entiende (mismos formatos que start)." }.status(400)
+        bool all_day = start["date_only"] or (body.has("all_day") and body["all_day"] == true)
+        long s_ms = start["ms"]
+        long e_ms = 0
+        if all_day:
+            # Medianoches UTC: la fecha de start/end, inclusive la última.
+            s_ms = s_ms - s_ms % 86400000
+            e_ms = end == null ? s_ms + 86400000 : end["ms"] - end["ms"] % 86400000 + 86400000
+        else:
+            e_ms = end == null ? s_ms + 3600000 : end["ms"]
+        string cal_id = await resolve_calendar(uid, sget(body, "calendar", "").trim())
+        if cal_id == "":
+            return { "detail": "el calendario no existe (GET /api/calendars lista los tuyos)." }.status(400)
+        string id = new_id()
+        Json op = { "key": "api", "id": id, "calendar_id": cal_id, "title": sget(body, "title", ""), "start": s_ms, "end": e_ms,
+                    "tzid": tz, "all_day": all_day, "location": sget(body, "location", ""), "notes": sget(body, "notes", ""),
+                    "rrule": sget(body, "rrule", "") }
+        if body.has("reminders"):
+            op["reminders"] = body["reminders"]
+        if sget(op, "title", "").trim() == "":
+            return { "detail": "title es obligatorio." }.status(400)
+        Json r = await put_event(uid, op)
+        if not r["ok"]:
+            return { "detail": r["error"] }.status(400)
+        Json row = first(await sqlite.query("select * from events where id = ?", id))
+        return { "event": event_view(row) }.status(201)

@@ -50,7 +50,7 @@ ssh -t usuario@servidor sudo calendar-cli createuser TUNOMBRE
 
 `deploy.sh` empaqueta la app y el binario de Lux, los envía por SSH y ejecuta el instalador. **Convive con Drive**: usuario `calendar`, `/opt/calendar`, `/var/lib/calendar`, puerto 8100 y su **propio** binario de Lux (`/opt/calendar/lux`); no toca el `lux` del sistema. Al actualizar conserva la base de datos y `calendar.env`, y si el servicio no arranca vuelve solo a la versión anterior (`--dry-run` enseña lo que haría).
 
-Órdenes de administración (`calendar-cli`): `createuser`, `passwd` (cierra las sesiones abiertas), `listusers`, `totp NOMBRE [--off]`, `disable`, `maintenance`.
+Órdenes de administración (`calendar-cli`): `createuser`, `passwd` (cierra las sesiones abiertas), `token` (token de larga vida para scripts), `listusers`, `totp NOMBRE [--off]`, `disable`, `maintenance`.
 
 Variables en `/etc/calendar/calendar.env`: `CALENDAR_DB`, `BIND_PORT`, `CALENDAR_HOST` (**la IP de Tailscale del servidor, siempre**: el instalador la lee con `tailscale ip -4` y se niega a instalar sin ella; `run.sh` se niega a arrancar con `0.0.0.0` y espera a que tailscaled ponga la IP tras un reinicio), `CALENDAR_PROXY` (0).
 
@@ -69,6 +69,30 @@ calendar-desktop
 
 Instala el servicio `calendar-daemon` (systemd, como tu usuario, arranca con el equipo) y la ventana. La primera vez pide la dirección del servidor y tu cuenta: el servidor entrega un token a este equipo y la contraseña no se guarda. La copia local y el token viven en `/var/lib/calendar-daemon` (sólo tu usuario). `journalctl -u calendar-daemon -f` es el registro.
 
+## Android
+
+La APK lleva dentro el mismo servicio de escritorio (réplica local, sincronización y avisos) y la misma interfaz, en un solo proceso: un
+`WebView` carga la página por loopback y el servicio habla con tu servidor **por Tailscale**, así que el móvil necesita la VPN activa. La
+dirección del servidor es la misma que en el escritorio: `http://<IP de Tailscale>:8100`.
+
+```bash
+export ANDROID_NDK=...                                   # r26+, API mínima 28
+desktop/tools/android-build.sh arm64-v8a x86_64          # OpenSSL + curl + SQLite + zonas horarias + libluxlocal.so por ABI
+cd desktop/android && gradle assembleDebug               # JDK 17, Gradle 8.7, SDK 34 (sdk.dir en local.properties)
+```
+
+- **Cómo se monta** (`desktop/CMakeLists.txt`, rama `ANDROID`): el servicio (`desktop/daemon`), la interfaz (`desktop/app/public`) y los datos de zonas
+  horarias se juntan en una sola app Lux; `desktop/android/overlay/` sustituye lo que difiere (`app.lux`: sirve también la interfaz;
+  `notify.lux`: los avisos son notificaciones de Android en lugar de `notify-send`).
+- **Zonas horarias**: el NDK no trae la base de zonas de C++20, así que en Android `lux_script/tz.hpp` usa la librería date/tz de Howard Hinnant
+  (`desktop/third_party/date`) con los ficheros de texto de IANA (`desktop/android/tzdata`, versión 2026e). La zona es la del teléfono.
+- **API local**: otras apps del teléfono pueden abrir el puerto de loopback, así que la API exige el secreto de `api-token` (cabecera
+  `X-Calendar-Token`); la actividad lo lee de su carpeta privada y se lo pasa a la página en `#t=…`.
+- **Avisos con la app cerrada**: sin servicio en primer plano ni notificación fija, una cadena de alarmas que despiertan el móvil llama cada minuto a
+  `POST /api/tick` (sincroniza y lanza los avisos que toquen). Con el acceso especial «Alarmas y recordatorios» (o la excepción de batería) la alarma es exacta; en
+  Doze profundo Android puede espaciarlas. Un aviso puede llegar con hasta un par de minutos de retraso.
+- Interfaz móvil: vista Agenda por defecto, calendarios en un cajón (☰ o deslizar a la derecha), botón flotante para crear eventos, «atrás» cierra diálogos.
+
 ## API del servidor
 
 Autenticación con `Authorization: Bearer <token>` (ámbitos `read` y `write`). Errores como `{"detail": "…"}`.
@@ -81,6 +105,27 @@ POST /api/ops                 lote {run, ops:[…]} de hasta 1000 operaciones
 GET  /api/occurrences?after&before&calendars   series ya expandidas (ms UTC)
 GET  /healthz
 ```
+
+### Crear cosas por request
+
+`POST /api/ops` es el contrato de los clientes (ids propios, milisegundos UTC, `base_rev`). Para scripts, automatizaciones o `curl` hay una capa más simple
+que no pide ids ni claves y entiende fechas ISO; pasa por la misma validación (`put_event` / `put_calendar`) y los clientes lo reciben por `/api/changes`.
+
+```bash
+sudo calendar-cli token eldur --name "mi script"        # token de larga vida (se muestra una sola vez); --read-only para solo leer
+TOKEN=...; H="Authorization: Bearer $TOKEN"; API=http://<IP de Tailscale>:8100
+
+curl -H "$H" -H 'content-type: application/json' $API/api/events -d '{"title":"Dentista","start":"2026-10-12T10:00"}'
+curl -H "$H" -H 'content-type: application/json' $API/api/events -d '{"title":"Reunión","start":"2026-10-12T10:00:00+02:00","end":"2026-10-12T11:00:00+02:00",
+  "calendar":"Trabajo","reminders":[0,10],"rrule":"FREQ=WEEKLY;BYDAY=MO","location":"Sala 2","notes":"…"}'
+curl -H "$H" -H 'content-type: application/json' $API/api/events -d '{"title":"Viaje","start":"2026-10-12","end":"2026-10-14"}'   # todo el día, fin inclusive
+curl -H "$H" -H 'content-type: application/json' $API/api/calendars -d '{"name":"Trabajo","color":"#1d4ed8"}'
+curl -H "$H" $API/api/calendars                                                                                              # ids y nombres
+```
+
+- `POST /api/events` → `201 {"event": …}`. Obligatorios `title` y `start`; opcionales `end` (por defecto +1 hora), `all_day`, `tzid`, `calendar` (id o nombre; por defecto el primero, y se crea «Personal» si no hay ninguno), `location`, `notes`, `reminders` (minutos antes), `rrule`.
+- Fechas: `"2026-10-12T10:00"` (hora de pared en `tzid`, por defecto `CALENDAR_DEFAULT_TZ` = Europe/Madrid, con el horario de verano que toque), con zona y segundos (`…:00+02:00`, `…:00Z`), `"2026-10-12"` (todo el día; `end` es el último día, inclusive) o milisegundos UTC.
+- `POST /api/calendars` → `201 {"calendar": …}`; `GET /api/calendars` lista los tuyos. Errores como `{"detail": …}` (400 si falta o no vale algo, 401 sin token, 403 con un token de solo lectura).
 
 - **`changes`**: cada cambio de un calendario o evento tiene una revisión única (`rev`) y los borrados viajan como lápidas durante 30 días. Se pagina (`more`); si la respuesta trae `reset`, el cliente estaba demasiado atrasado y debe volver a bajarlo todo.
 - **`ops`**: `cal.put`, `cal.delete`, `event.put`, `event.delete`, cada una con su `key` y un `base_rev` opcional. Un lote es atómico en su conjunto pero cada operación responde por separado (un fallo no corta el resto) y es **idempotente**: repetir un lote no cambia nada ni sube revisiones. Si `base_rev` es más viejo que el servidor, responde `conflict` con la versión actual.

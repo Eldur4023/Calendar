@@ -124,6 +124,12 @@ get endpoint("/api/alerts", long since = 0):
     await need_token()
     return { "alerts": await sqlite.query("select * from alerts where at > ? order by id desc limit 50", since) }
 
+# Una pasada de sincronización y avisos (ver tick() en sync.lux).
+post endpoint("/api/tick"):
+    await need_token()
+    await tick()
+    return { "ok": true }
+
 get endpoint("/healthz"):
     return { "status": "ok" }
 

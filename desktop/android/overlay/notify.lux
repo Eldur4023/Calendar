@@ -1,0 +1,6 @@
+# Android: el aviso es una notificación del sistema (window.notify → LuxLocal.notify, ver src/android.cpp).
+# Sustituye a daemon/notify.lux al montar la app del móvil (CMakeLists.txt).
+
+fn bool desktop_notify(string title, string body):
+    window.notify(title, body)
+    return true

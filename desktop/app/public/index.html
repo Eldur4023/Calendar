@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <title>Calendar</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -26,6 +26,7 @@
 </defs></svg>
 
 <header class="top">
+  <button id="btn-menu" class="ghost icon menu-only" title="Calendarios" aria-label="Calendarios"><svg class="ico"><use href="#i-log"/></svg></button>
   <div class="brand"><span class="logo"><svg class="ico"><use href="#i-cal"/></svg></span><b>Calendar</b></div>
   <div id="nav" class="nav" hidden>
     <button id="btn-today" class="ghost">Hoy</button>
@@ -67,6 +68,7 @@
   </form>
 </section>
 
+<button id="fab" class="primary fab" title="Nuevo evento" aria-label="Nuevo evento" hidden><svg class="ico"><use href="#i-plus"/></svg></button>
 <div id="layout" class="layout" hidden>
   <aside id="side" class="side">
     <button id="btn-new" class="primary wide"><svg class="ico"><use href="#i-plus"/></svg>Nuevo evento</button>

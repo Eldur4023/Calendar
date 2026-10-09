@@ -5,6 +5,7 @@
 #
 #   sudo calendar-cli createuser NOMBRE [--password P]
 #   sudo calendar-cli passwd NOMBRE [--password P]
+#   sudo calendar-cli token NOMBRE [--name ETIQUETA] [--read-only]   token de larga vida para scripts
 #   sudo calendar-cli listusers
 #   sudo calendar-cli totp NOMBRE [--off]       segundo factor (muestra el secreto)
 #   sudo calendar-cli disable NOMBRE            desactiva la cuenta y cierra sus sesiones
@@ -21,7 +22,7 @@ APP_DIR="${CALENDAR_APP_DIR:-/opt/calendar}"
 SERVICE_USER=calendar
 
 uso() {
-    sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
