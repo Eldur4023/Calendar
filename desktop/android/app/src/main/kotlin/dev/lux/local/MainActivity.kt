@@ -13,6 +13,7 @@ import android.webkit.WebViewClient
 class MainActivity : Activity() {
     private lateinit var web: WebView
     private var chooser: ValueCallback<Array<Uri>>? = null
+    private var port = 0
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -45,10 +46,38 @@ class MainActivity : Activity() {
         // Compiling the app and opening SQLite can take a few seconds on a cold start: not on the UI thread.
         // start() is idempotent: if this process already runs the server (the Activity was only recreated), it returns its port.
         Thread {
-            val port = Sync.boot(this)   // idempotent: reuses the server if the process was only kept alive
+            port = Sync.boot(this)   // idempotent: reuses the server if the process was only kept alive
             val token = if (port > 0) Sync.token(this) else ""
             runOnUiThread { if (port < 0) finish() else web.loadUrl("http://127.0.0.1:$port/#t=$token") }
+            if (port > 0) importIcs(intent)
         }.start()
+    }
+
+    override fun onNewIntent(i: Intent) {
+        super.onNewIntent(i)
+        if (port > 0) Thread { importIcs(i) }.start()
+    }
+
+    // Un .ics recibido con ACTION_VIEW (p. ej. desde Mail): se manda a /api/import-ics del propio servicio y se avisa del resultado.
+    private fun importIcs(i: Intent?) {
+        val uri = i?.data ?: return
+        if (i.action != Intent.ACTION_VIEW) return
+        i.action = null   // que recrear la actividad no lo importe otra vez
+        val msg = try {
+            val text = contentResolver.openInputStream(uri)!!.use { it.readBytes() }.toString(Charsets.UTF_8)
+            val c = java.net.URL("http://127.0.0.1:$port/api/import-ics").openConnection() as java.net.HttpURLConnection
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            c.setRequestProperty("X-Calendar-Token", Sync.token(this))
+            c.outputStream.use { it.write(org.json.JSONObject().put("ics", text).toString().toByteArray()) }
+            val ok = c.responseCode == 200
+            val body = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+            val j = org.json.JSONObject(body)
+            if (ok) "Añadido a Calendar: " + (0 until j.getJSONArray("titles").length()).joinToString(", ") { j.getJSONArray("titles").getString(it) }
+            else j.optString("detail", "No se pudo importar el evento")
+        } catch (e: Exception) { "No se pudo importar el evento" }
+        runOnUiThread { android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show(); web.reload() }
     }
 
     // First launch only: notification permission (Android 13+) and exemption from battery optimisation,
