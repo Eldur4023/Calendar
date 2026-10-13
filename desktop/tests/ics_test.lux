@@ -1,0 +1,38 @@
+# Lector de .ics (daemon/ics.lux): `lux test daemon tests/ics_test.lux` desde desktop/.
+
+import test
+
+test "invitación de Google Calendar":
+    string ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:abc123@google.com\r\nDTSTART;TZID=Europe/Madrid:20261028T173000\r\nDTEND;TZID=Europe/Madrid:20261028T193000\r\nSUMMARY:Python para\r\n  Desarrolladores\r\nLOCATION:Zoom\\, sala 1\r\nDESCRIPTION:Linea 1\\nLinea 2\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    Json r = ics_parse(ics, "cal")
+    test.eq(len(r["ops"]), 1)
+    Json o = r["ops"][0]
+    test.eq(o["title"], "Python para Desarrolladores")
+    test.eq(o["location"], "Zoom, sala 1")
+    test.eq(o["notes"], "Linea 1\nLinea 2")
+    test.eq(o["start"], time.parse_iso("2026-10-28T16:30:00Z"))   # CET = UTC+1 desde el 25 de octubre
+    test.eq(o["end"], time.parse_iso("2026-10-28T18:30:00Z"))
+    test.eq(o["tzid"], "Europe/Madrid")
+    test.eq(o["reminders"][0], 15)
+    test.eq(o["id"], hash.sha256("abc123@google.com").slice(0, 32))
+
+test "UTC, todo el día, serie y cancelados":
+    string ics = "BEGIN:VEVENT\nUID:a\nDTSTART:20260701T100000Z\nDURATION:PT1H30M\nRRULE:FREQ=WEEKLY;COUNT=3\nSUMMARY:Serie\nEND:VEVENT\nBEGIN:VEVENT\nUID:b\nDTSTART;VALUE=DATE:20260801\nDTEND;VALUE=DATE:20260803\nSUMMARY:Vacaciones\nEND:VEVENT\nBEGIN:VEVENT\nUID:c\nDTSTART:20260901T100000Z\nSTATUS:CANCELLED\nEND:VEVENT\nBEGIN:VEVENT\nUID:a\nRECURRENCE-ID:20260708T100000Z\nDTSTART:20260708T120000Z\nEND:VEVENT\n"
+    Json r = ics_parse(ics, "cal")
+    test.eq(len(r["ops"]), 2)
+    test.eq(r["skipped"], 2)
+    test.eq(r["ops"][0]["end"] - r["ops"][0]["start"], 5400000)
+    test.eq(r["ops"][0]["rrule"], "FREQ=WEEKLY;COUNT=3")
+    test.eq(r["ops"][1]["all_day"], true)
+    test.eq(r["ops"][1]["end"] - r["ops"][1]["start"], 172800000)
+
+test "POST /api/import-ics crea el evento y reimportar no duplica":
+    await local_apply([{ "op": "cal.put", "id": "calendario1", "name": "Personal", "color": "#336699" }])
+    string ics = "BEGIN:VEVENT\nUID:xyz\nDTSTART:20261101T090000Z\nDTEND:20261101T100000Z\nSUMMARY:Reunión\nEND:VEVENT\n"
+    Json h = { "X-Calendar-Token": await setting("api_token", "") }
+    Json r = await http.post(test.base_url() + "/api/import-ics", { "ics": ics }, h)
+    test.eq(r["status"], 200, str(r["body"]))
+    test.eq(r["body"]["imported"], 1)
+    r = await http.post(test.base_url() + "/api/import-ics", { "ics": ics }, h)
+    test.eq(r["status"], 200)
+    test.eq(len(await sqlite.query("select id from events where title = ?", "Reunión")), 1)

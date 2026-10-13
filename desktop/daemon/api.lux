@@ -111,6 +111,34 @@ post endpoint("/api/ops", Json body):
         return { "detail": "Como mucho 200 operaciones por lote." }.status(413)
     return { "results": await local_apply(body["ops"]) }
 
+# Importa un .ics (cuerpo: {ics, calendar_id?}); sin calendar_id usa el primero.
+post endpoint("/api/import-ics", Json body):
+    await need_token()
+    string calendar_id = body.has("calendar_id") ? str(body["calendar_id"]) : ""
+    if calendar_id == "":
+        Json c = first(await sqlite.query("select id from calendars order by position, name limit 1"))
+        if c == null:
+            return { "detail": "No hay ningún calendario donde importar." }.status(409)
+        calendar_id = str(c["id"])
+    Json parsed = ics_parse(str(body["ics"]), calendar_id)
+    List<Json> ops = parsed["ops"]
+    if len(ops) == 0:
+        return { "detail": "El fichero no contiene eventos importables." }.status(400)
+    if len(ops) > 200:
+        return { "detail": "Como mucho 200 eventos por importación." }.status(413)
+    List<Json> results = await local_apply(ops)
+    int done = 0
+    List<string> errors = []
+    List<string> titles = []
+    for Json o in ops:
+        titles.add(str(o["title"]))
+    for Json r in results:
+        if r["ok"]:
+            done = done + 1
+        else:
+            errors.add(str(r["error"]))
+    return { "imported": done, "skipped": parsed["skipped"], "errors": errors, "titles": titles }
+
 post endpoint("/api/sync"):
     await need_token()
     state.set("backoff_until", 0)

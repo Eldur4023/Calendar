@@ -1,0 +1,148 @@
+# Importar iCalendar (.ics): invitaciones de correo, ficheros exportados de otro calendario.
+#
+# Lee los VEVENT y los convierte en operaciones `event.put` (las mismas que manda la
+# ventana). El id sale del UID, así que volver a importar la misma invitación actualiza
+# el evento en vez de duplicarlo. Se ignoran las excepciones de una serie
+# (RECURRENCE-ID) y los eventos cancelados.
+# ponytail: la zona de las horas en UTC (Z) o flotantes es la local, aunque la serie sea
+# semanal y cruce un cambio de horario; no se leen los VTIMEZONE (sólo nombres IANA).
+
+# Las líneas plegadas (empiezan por espacio o tabulador) continúan la anterior.
+fn List<string> ics_lines(string text):
+    List<string> out = []
+    for string l in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if (l.starts_with(" ") or l.starts_with("\t")) and len(out) > 0:
+            out[len(out) - 1] = out[len(out) - 1] + l.slice(1)
+        elif l != "":
+            out.add(l)
+    return out
+
+fn string ics_unescape(string s):
+    return s.replace("\\\\", "@@BS@@").replace("\\n", "\n").replace("\\N", "\n").replace("\\,", ",").replace("\\;", ";").replace("@@BS@@", "\\")
+
+# Segundos de desfase de `tz` en el instante `t`.
+fn int tz_offset(long t, string tz):
+    return time.parse_iso(time.format(t, "%Y-%m-%dT%H:%M:%S", tz)) - t
+
+# El instante UTC de una hora de pared (dada como "UTC" en `wall`) en la zona `tz`.
+fn long wall_to_utc(long wall, string tz):
+    long utc = wall - tz_offset(wall, tz)
+    return wall - tz_offset(utc, tz)
+
+# "20261028T173000Z" / "20261028T173000" / "20261028" -> [instante UTC, es_fecha, tiene_Z]
+fn Json ics_time(string value, string tzid):
+    List<string> g = regex.groups("^([0-9]{4})([0-9]{2})([0-9]{2})(T([0-9]{2})([0-9]{2})([0-9]{2})?)?(Z?)$", value.trim())
+    if g == null:
+        return null
+    string iso = g[1] + "-" + g[2] + "-" + g[3]
+    if g[4] == null or g[4] == "":
+        return { "ms": time.parse_iso(iso), "date": true }
+    iso = iso + "T" + g[5] + ":" + g[6] + ":" + (g[7] == null or g[7] == "" ? "00" : g[7])
+    long wall = time.parse_iso(iso)
+    if g[8] == "Z":
+        return { "ms": wall, "date": false }
+    return { "ms": wall_to_utc(wall, tzid), "date": false }
+
+# "PT1H30M", "P1D", "-PT15M" -> milisegundos con signo
+fn long ics_duration(string v):
+    int t = v.index_of("T")
+    string days = t < 0 ? v : v.slice(0, t)
+    string clock = t < 0 ? "" : v.slice(t)
+    long total = 0
+    for Json u in [["W", days, 604800000], ["D", days, 86400000], ["H", clock, 3600000], ["M", clock, 60000], ["S", clock, 1000]]:
+        List<string> g = regex.groups("([0-9]+)" + str(u[0]), str(u[1]))
+        if g != null:
+            total = total + int(g[1]) * int(u[2])
+    return v.starts_with("-") ? 0 - total : total
+
+fn string ics_tzid(string head, string fallback):
+    List<string> g = regex.groups("TZID=([^;:]+)", head)
+    if g == null:
+        return fallback
+    string tz = g[1].replace("\"", "")
+    return valid_tz(tz) ? tz : fallback
+
+# Lee todos los VEVENT del texto; `out_skipped` cuenta los que no se pueden importar.
+fn Json ics_parse(string text, string calendar_id):
+    List<Json> ops = []
+    int skipped = 0
+    string local = local_tz()
+    Json ev = null
+    int alarm = 0
+    for string line in ics_lines(text):
+        int colon = line.index_of(":")
+        if colon < 0:
+            continue
+        string head = line.slice(0, colon)
+        string value = line.slice(colon + 1)
+        string name = head.split(";")[0].upper()
+        if name == "BEGIN" and value.upper() == "VEVENT":
+            ev = { "reminders": [], "exdates": [], "cancelled": false, "override": false }
+            alarm = 0
+        elif ev == null:
+            continue
+        elif name == "BEGIN" and value.upper() == "VALARM":
+            alarm = 1
+        elif name == "END" and value.upper() == "VALARM":
+            alarm = 0
+        elif alarm == 1:
+            if name == "TRIGGER" and not head.contains("VALUE=DATE-TIME") and value.starts_with("-"):
+                long ms = 0 - ics_duration(value)
+                if ms >= 0 and ms <= 40320 * 60000 and len(ev["reminders"]) < 10:
+                    ev["reminders"].add(ms / 60000)
+        elif name == "END" and value.upper() == "VEVENT":
+            string tz = ev.has("tzid") ? str(ev["tzid"]) : local
+            Json s = ev.has("dtstart") ? ics_time(str(ev["dtstart"]), tz) : null
+            if s == null or ev["cancelled"] or ev["override"]:
+                skipped = skipped + 1
+                ev = null
+                continue
+            long start = s["ms"]
+            long end = start
+            if ev.has("dtend") and ics_time(str(ev["dtend"]), ev.has("tzend") ? str(ev["tzend"]) : tz) != null:
+                end = ics_time(str(ev["dtend"]), ev.has("tzend") ? str(ev["tzend"]) : tz)["ms"]
+            elif ev.has("duration"):
+                end = start + ics_duration(str(ev["duration"]))
+            elif s["date"]:
+                end = start + 86400000
+            if end < start or (s["date"] and end <= start):
+                end = s["date"] ? start + 86400000 : start
+            List<int> ex = []
+            for string x in ev["exdates"]:
+                Json t = ics_time(x, tz)
+                if t != null:
+                    ex.add(t["ms"])
+            string uid = ev.has("uid") ? str(ev["uid"]) : ""
+            ops.add({
+                "op": "event.put", "id": uid == "" ? new_id() : hash.sha256(uid).slice(0, 32), "calendar_id": calendar_id,
+                "title": ev.has("title") ? str(ev["title"]) : "", "location": ev.has("location") ? str(ev["location"]) : "",
+                "notes": ev.has("notes") ? str(ev["notes"]) : "", "start": start, "end": end, "all_day": s["date"],
+                "tzid": tz, "rrule": ev.has("rrule") ? str(ev["rrule"]) : "", "exdates": ex, "reminders": ev["reminders"]
+            })
+            ev = null
+        elif name == "SUMMARY":
+            ev["title"] = ics_unescape(value)
+        elif name == "LOCATION":
+            ev["location"] = ics_unescape(value)
+        elif name == "DESCRIPTION":
+            ev["notes"] = ics_unescape(value)
+        elif name == "UID":
+            ev["uid"] = value.trim()
+        elif name == "DTSTART":
+            ev["dtstart"] = value
+            ev["tzid"] = ics_tzid(head, local)
+        elif name == "DTEND":
+            ev["dtend"] = value
+            ev["tzend"] = ics_tzid(head, local)
+        elif name == "DURATION":
+            ev["duration"] = value
+        elif name == "RRULE":
+            ev["rrule"] = value.trim()
+        elif name == "EXDATE":
+            for string x in value.split(","):
+                ev["exdates"].add(x)
+        elif name == "RECURRENCE-ID":
+            ev["override"] = true
+        elif name == "STATUS" and value.trim().upper() == "CANCELLED":
+            ev["cancelled"] = true
+    return { "ops": ops, "skipped": skipped }
