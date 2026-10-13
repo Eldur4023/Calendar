@@ -7,6 +7,7 @@
 #   fired      avisos ya lanzados (uno por evento, aparición y antelación)
 #   alerts     los avisos recientes, para que la ventana los muestre
 #   log        sucesos para la ventana (conflictos, errores, sincronizaciones)
+#   weather    previsión por día (código WMO, máx, mín, % lluvia); la escribe Flux por POST /api/weather
 #
 # MIGRACIONES: como en el servidor, una lista de versiones que sólo crece.
 
@@ -82,6 +83,19 @@ fn List<Json> migrations():
                 ts integer not null,
                 level text not null,
                 message text not null
+            )
+            """
+        ],
+        [
+            # v2: previsión del tiempo por día (la rellena Flux; la ventana pinta un icono en cada día si hay dato)
+            """
+            create table weather (
+                day text primary key,
+                code integer not null,
+                tmax real,
+                tmin real,
+                prob integer,
+                updated_at integer not null
             )
             """
         ]

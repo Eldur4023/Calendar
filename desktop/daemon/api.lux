@@ -92,7 +92,8 @@ get endpoint("/api/data", long after, long before):
     return {
         "status": await status_view(),
         "calendars": await calendars_list(),
-        "occurrences": await visible_occurrences(after, before)
+        "occurrences": await visible_occurrences(after, before),
+        "weather": await weather_between(after, before)
     }
 
 get endpoint("/api/events/:id", string id):
@@ -168,3 +169,33 @@ on error:
         log.error("error " + str(code) + " en " + request.method + " " + request.path + ": " + error.message)
         detail = "Error interno."
     return { "detail": detail }
+
+# Previsión por día para el rango [after, before): { "AAAA-MM-DD": { code, tmax, tmin, prob } }. Los días sin dato no salen.
+fn Json weather_between(long after, long before):
+    List<Json> rows = await sqlite.query("select day, code, tmax, tmin, prob from weather where day >= ? and day <= ?",
+        time.format(after, "%Y-%m-%d", local_tz()), time.format(before, "%Y-%m-%d", local_tz()))
+    Json out = {}
+    for Json r in rows:
+        out[str(r["day"])] = { "code": r["code"], "tmax": r["tmax"], "tmin": r["tmin"], "prob": r["prob"] }
+    return out
+
+# La previsión la manda un programa de confianza del equipo (Flux) con el secreto de la API local:
+# { "days": { "2026-10-14": { "code": 3, "tmax": 25.1, "tmin": 14.2, "prob": 10 }, ... } }
+post endpoint("/api/weather", Json body):
+    await need_token()
+    if not body.has("days") or body["days"] == null:
+        return { "detail": "Falta «days»." }.status(400)
+    int saved = 0
+    for string day in body["days"]:
+        if not regex.test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", day) or saved >= 40:
+            continue
+        Json d = body["days"][day]
+        if not d.has("code") or d["code"] == null:
+            continue
+        await sqlite.exec("insert into weather (day, code, tmax, tmin, prob, updated_at) values (?, ?, ?, ?, ?, ?) on conflict(day) do update set code = excluded.code, tmax = excluded.tmax, tmin = excluded.tmin, prob = excluded.prob, updated_at = excluded.updated_at",
+            day, int(d["code"]), d.has("tmax") and d["tmax"] != null ? float(d["tmax"]) : null, d.has("tmin") and d["tmin"] != null ? float(d["tmin"]) : null,
+            d.has("prob") and d["prob"] != null ? int(d["prob"]) : null, time.now())
+        saved = saved + 1
+    # solo interesa lo reciente y lo futuro: se tira lo de hace más de 7 días
+    await sqlite.exec("delete from weather where day < ?", time.format(time.now() - 7 * 86400000, "%Y-%m-%d", local_tz()))
+    return { "saved": saved }

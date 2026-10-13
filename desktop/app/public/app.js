@@ -65,7 +65,7 @@
     return api("GET", "/api/data?after=" + r.from.getTime() + "&before=" + r.to.getTime()).then((res) => {
       if (seq !== S.loadSeq) return;
       if (!res.ok) { showBanner(res.body && res.body.detail ? res.body.detail : "No se pudo leer el calendario.", true); return; }
-      S.status = res.body.status; S.cals = res.body.calendars; S.occ = res.body.occurrences;
+      S.status = res.body.status; S.cals = res.body.calendars; S.occ = res.body.occurrences; S.wx = res.body.weather || {};
       if (S.sel && !S.occ.some((o) => keyOf(o) === S.sel)) S.sel = null;
       ensureDefaultCalendar();
       render();
@@ -192,6 +192,20 @@
     return (o.title || "(sin título)") + "\n" + (n.allDay ? "Todo el día" : L.hm(n.start) + " – " + L.hm(n.end)) + (o.location ? "\n" + o.location : "") + (o.recurring || o.master_id ? "\nPeriódico" : "");
   }
 
+  /* ── tiempo: icono por día si hay previsión (la pone Flux); si no, nada ── */
+  const WX = { 0: ["☀️", "despejado"], 1: ["🌤️", "mayormente despejado"], 2: ["⛅", "parcialmente nublado"], 3: ["☁️", "nublado"], 45: ["🌫️", "niebla"], 48: ["🌫️", "niebla con escarcha"],
+    51: ["🌦️", "llovizna"], 53: ["🌦️", "llovizna"], 55: ["🌧️", "llovizna intensa"], 56: ["🌧️", "llovizna helada"], 57: ["🌧️", "llovizna helada"],
+    61: ["🌦️", "lluvia ligera"], 63: ["🌧️", "lluvia"], 65: ["🌧️", "lluvia intensa"], 66: ["🌧️", "lluvia helada"], 67: ["🌧️", "lluvia helada"],
+    71: ["🌨️", "nieve ligera"], 73: ["🌨️", "nieve"], 75: ["❄️", "nieve intensa"], 77: ["🌨️", "granizo fino"],
+    80: ["🌦️", "chubascos"], 81: ["🌧️", "chubascos"], 82: ["⛈️", "chubascos intensos"], 85: ["🌨️", "chubascos de nieve"], 86: ["🌨️", "chubascos de nieve"],
+    95: ["⛈️", "tormenta"], 96: ["⛈️", "tormenta con granizo"], 99: ["⛈️", "tormenta con granizo"] };
+  function wxHtml(day) {
+    const w = (S.wx || {})[L.ymd(day)], m = w && WX[w.code];
+    if (!m) return "";
+    const t = (w.tmax != null ? "máx " + Math.round(w.tmax) + "°" : "") + (w.tmin != null ? " · mín " + Math.round(w.tmin) + "°" : "") + (w.prob ? " · lluvia " + w.prob + "%" : "");
+    return '<span class="wx" title="' + esc(m[1] + (t ? " — " + t : "")) + '">' + m[0] + "</span>";
+  }
+
   function monthHtml() {
     const r = L.rangeFor("month", S.date), today = new Date();
     let h = '<div class="month"><div class="dow">';
@@ -200,7 +214,7 @@
     for (let i = 0; i < 42; i++) {
       const day = L.addDays(r.from, i), list = S.items.filter((n) => L.touchesDay(n, day));
       const cls = "cell" + (day.getMonth() !== S.date.getMonth() ? " out" : "") + (L.sameDay(day, today) ? " today" : "");
-      h += '<div class="' + cls + '" data-d="' + L.ymd(day) + '"><span class="dn" data-day="' + L.ymd(day) + '">' + (day.getDate() === 1 ? day.getDate() + " " + MONTHS_SHORT[day.getMonth()] : day.getDate()) + "</span>";
+      h += '<div class="' + cls + '" data-d="' + L.ymd(day) + '"><span class="dn" data-day="' + L.ymd(day) + '">' + (day.getDate() === 1 ? day.getDate() + " " + MONTHS_SHORT[day.getMonth()] : day.getDate()) + "</span>" + wxHtml(day);
       list.slice(0, 3).forEach((n) => { h += chip(n); });
       if (list.length > 3) h += '<div class="more" data-day="' + L.ymd(day) + '">+' + (list.length - 3) + " más</div>";
       h += "</div>";
@@ -213,7 +227,7 @@
     const days = []; for (let i = 0; i < cols; i++) days.push(L.addDays(r.from, i));
     let h = '<div class="tg" style="--cols:' + cols + '"><div class="tg-head"><div class="tg-row tg-days"><div></div>';
     days.forEach((d) => {
-      h += '<div class="' + (L.sameDay(d, today) ? "today" : "") + '" data-day="' + L.ymd(d) + '"><div class="dw">' + DOW[L.weekday(d)] + '</div><div class="dd">' + d.getDate() + "</div></div>";
+      h += '<div class="' + (L.sameDay(d, today) ? "today" : "") + '" data-day="' + L.ymd(d) + '"><div class="dw">' + DOW[L.weekday(d)] + '</div><div class="dd">' + d.getDate() + "</div>" + wxHtml(d) + "</div>";
     });
     h += '</div><div class="tg-row tg-allday"><div class="lbl">todo el día</div>';
     days.forEach((d) => { h += "<div>" + S.items.filter((n) => n.allDay && L.touchesDay(n, d)).map(chip).join("") + "</div>"; });
